@@ -1,0 +1,59 @@
+# Lumen Push Relay — example configuration
+#
+# This file is optional. For simple deployments, set everything via
+# environment variables (see docker-compose.yml). Mount this file at
+# /config/config.yaml for advanced per-camera rules.
+
+frigate:
+  mqtt_host: 192.168.1.50      # your MQTT broker (Mosquitto, EMQX, HA broker, etc.)
+  mqtt_port: 1883
+  # mqtt_user: your_user       # optional
+  # mqtt_password: your_pass   # optional
+  topic: frigate/events        # Frigate's default event topic
+
+mode: worker                   # "worker" (recommended) or "direct"
+
+worker:
+  # Push URL is unique to your device. Get it from Lumen:
+  # Settings → Push Notifications → Copy URL
+  push_url: "https://lumen-push.mail5491.workers.dev/v1/notify/YOUR_SECRET/YOUR_DEVICE_TOKEN"
+
+# Direct mode only — most users should use "worker" mode above instead.
+# Use "direct" if you want to self-host the APNs path and skip the Cloudflare Worker.
+# apns:
+#   key_file: /config/AuthKey.p8
+#   key_id: ABC123DEFG
+#   team_id: TDV6D5L785
+#   bundle_id: com.lorislab.lumenforfrigate.Lumen-for-Frigate
+#   environment: production    # "production" for App Store/TestFlight, "sandbox" for Xcode builds
+# devices:
+#   - token: "your_64_char_hex_device_token_here"
+
+filters:
+  labels:                      # only notify for these labels
+    - person
+    - car
+    - package
+  min_score: 0.6               # minimum detection confidence (0.0 - 1.0)
+  cooldown_seconds: 120        # minimum delay between pushes for same camera+label
+
+  # Advanced: per-camera overrides
+  # cameras:
+  #   front_door:
+  #     enabled: true
+  #     labels: [person, package]
+  #     required_zones: [porch, walkway]
+  #     min_score: 0.7
+  #     # Custom message when a specific zone is triggered
+  #     zone_messages:
+  #       mailbox:
+  #         title: "Mail activity"
+  #         body: "Someone was spotted at the mailbox"
+  #
+  #   driveway:
+  #     enabled: true
+  #     labels: [car, person]
+  #     schedule: "22:00-07:00"  # only notify at night
+  #
+  #   garden:
+  #     enabled: false           # disable this camera

@@ -1,0 +1,27 @@
+services:
+  lumen-push-relay:
+    image: lorislabfr/lumen-push-relay:latest
+    # Or build locally:
+    # build: .
+    container_name: lumen-push-relay
+    restart: unless-stopped
+    environment:
+      # --- Required: your Frigate MQTT broker ---
+      MQTT_HOST: "192.168.1.50"         # change to your Frigate/MQTT IP
+      MQTT_PORT: "1883"
+      MQTT_TOPIC: "frigate/events"
+      # MQTT_USER: "your_user"          # optional
+      # MQTT_PASSWORD: "your_password"  # optional
+
+      # --- Required: your push URL from Lumen ---
+      # Get it from Lumen: Settings → Push Notifications → Copy URL
+      PUSH_URL: "https://lumen-push.mail5491.workers.dev/v1/notify/YOUR_SECRET/YOUR_DEVICE_TOKEN"
+
+      # --- Optional: filters ---
+      FILTER_LABELS: "person,car,dog,cat,package"
+      FILTER_MIN_SCORE: "0.6"
+      COOLDOWN_SECONDS: "120"
+
+    # Optional: mount a config file for advanced per-camera rules
+    # volumes:
+    #   - ./config.yaml:/config/config.yaml

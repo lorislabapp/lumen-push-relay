@@ -1,0 +1,24 @@
+[Unit]
+Description=Lumen Push Relay (Frigate MQTT -> APNs bridge)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/lumen-push-relay/venv/bin/python /opt/lumen-push-relay/relay.py
+Environment=CONFIG_PATH=/etc/lumen-push-relay/config.yaml
+Restart=always
+RestartSec=5
+User=lumen
+Group=lumen
+WorkingDirectory=/opt/lumen-push-relay
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadOnlyPaths=/etc/lumen-push-relay
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

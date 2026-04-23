@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+*.p8
+config.yaml
+!config.yaml.example
+.DS_Store
