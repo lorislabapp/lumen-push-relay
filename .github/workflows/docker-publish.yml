@@ -33,7 +33,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: lorislabfr/lumen-push-relay
+          images: lorislabapp/lumen-push-relay
           tags: |
             type=ref,event=branch
             type=semver,pattern={{version}}

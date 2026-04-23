@@ -23,7 +23,7 @@ docker run -d \
   --restart unless-stopped \
   -e MQTT_HOST=192.168.1.50 \
   -e PUSH_URL="paste-your-url-from-lumen-app" \
-  lorislabfr/lumen-push-relay
+  lorislabapp/lumen-push-relay
 ```
 
 Get your `PUSH_URL` from the Lumen app: **Settings → Push Notifications → Copy URL**.
@@ -33,7 +33,7 @@ Get your `PUSH_URL` from the Lumen app: **Settings → Push Notifications → Co
 ```yaml
 services:
   lumen-push-relay:
-    image: lorislabfr/lumen-push-relay:latest
+    image: lorislabapp/lumen-push-relay:latest
     container_name: lumen-push-relay
     restart: unless-stopped
     environment:
@@ -74,7 +74,7 @@ filters:
 ## Python setup (without Docker)
 
 ```bash
-git clone https://github.com/lorislabfr/lumen-push-relay.git
+git clone https://github.com/lorislabapp/lumen-push-relay.git
 cd lumen-push-relay
 pip install -r requirements.txt
 cp config.yaml.example config.yaml   # edit to match your setup
@@ -134,6 +134,6 @@ MIT — see [LICENSE](LICENSE).
 ## Related
 
 - [Lumen for Frigate](https://apps.apple.com/app/id6760238729) — native Apple companion app for Frigate NVR
-- [lumen-push](https://github.com/lorislabfr/lumen-push) — the Cloudflare Worker that receives events and signs APNs JWTs
+- [lumen-push](https://github.com/lorislabapp/lumen-push) — the Cloudflare Worker that receives events and signs APNs JWTs
 - [Frigate NVR](https://github.com/blakeblackshear/frigate) — open-source AI-powered NVR
 - [LorisLabs](https://lorislab.fr) — developer website

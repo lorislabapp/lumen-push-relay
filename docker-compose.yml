@@ -1,6 +1,6 @@
 services:
   lumen-push-relay:
-    image: lorislabfr/lumen-push-relay:latest
+    image: lorislabapp/lumen-push-relay:latest
     # Or build locally:
     # build: .
     container_name: lumen-push-relay
