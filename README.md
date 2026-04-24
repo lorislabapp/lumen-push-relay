@@ -15,6 +15,33 @@ Frigate publishes detection events over MQTT but does not send HTTP webhooks or 
 
 Only a compact payload (camera name, label, zone, confidence) leaves your network. Camera feeds, snapshots, and clips stay local.
 
+## Prerequisites
+
+You need an **MQTT broker** reachable from the machine that will run `lumen-push-relay`. Frigate needs MQTT enabled in its config anyway, and the relay subscribes to the same broker.
+
+**If you don't have one yet:**
+
+- **Home Assistant users** — install the *Mosquitto broker* add-on (Settings → Add-ons → Add-on Store → Mosquitto broker → Install → Start).
+- **Standalone (Docker)** — run Eclipse Mosquitto alongside Frigate:
+
+  ```bash
+  docker run -d --name mosquitto --restart unless-stopped \
+    -p 1883:1883 \
+    eclipse-mosquitto:2 \
+    mosquitto -c /mosquitto-no-auth.conf
+  ```
+
+Then enable MQTT in your `frigate.yml`:
+
+```yaml
+mqtt:
+  enabled: true
+  host: 192.168.1.50   # your MQTT broker IP (or the container name if on a shared docker network)
+  port: 1883
+```
+
+Restart Frigate so it picks up the MQTT config.
+
 ## Quick start — Docker
 
 ```bash
