@@ -179,6 +179,10 @@ def build_apns_payload(event: dict) -> dict:
         "camera": camera,
         "label": label,
         "zones": zones,
+        # Unix epoch seconds when Frigate first detected the event. The NSE uses
+        # this to show "detected Xs ago" so the user can tell real-time pushes
+        # apart from pushes that APNs held while the device was unreachable.
+        "detected_at": event.get("start_time"),
         "source": "mqtt-relay",
     }
 
@@ -197,6 +201,17 @@ def _in_schedule(schedule: str) -> bool:
 def should_notify(event: dict, config: dict) -> str | None:
     """Check if an event passes filters. Returns None if OK, or a reason string if suppressed."""
     filters = config.get("filters", {})
+
+    # Drop stale events (MQTT replay, relay backlog, broker queue). Forwarding
+    # these produces "fake-fresh" pushes on the device — user sees a banner now
+    # for something that happened hours ago. Default 120s, configurable via
+    # FILTER_MAX_EVENT_AGE / filters.max_event_age_seconds (0 disables).
+    max_age = filters.get("max_event_age_seconds", 120)
+    start_time = event.get("start_time")
+    if max_age and start_time:
+        age = time.time() - float(start_time)
+        if age > max_age:
+            return f"stale event (age={age:.0f}s > {max_age}s)"
 
     label = event.get("label", "")
     allowed_labels = filters.get("labels", [])
@@ -268,6 +283,7 @@ def load_config() -> dict:
             "labels": os.environ.get("FILTER_LABELS", "person,car,dog,cat,package").split(","),
             "min_score": float(os.environ.get("FILTER_MIN_SCORE", "0.6")),
             "cooldown_seconds": int(os.environ.get("COOLDOWN_SECONDS", "120")),
+            "max_event_age_seconds": int(os.environ.get("FILTER_MAX_EVENT_AGE", "120")),
         },
     }
 
@@ -392,11 +408,15 @@ async def run():
                             label, camera, score * 100, event.get("zones", []),
                         )
 
+                    send_start = time.time()
                     ok = await sender.send(event)
+                    send_ms = int((time.time() - send_start) * 1000)
+                    event_age_s = (send_start - float(event["start_time"])) if event.get("start_time") else None
+                    age_str = f"event_age={event_age_s:.1f}s " if event_age_s is not None else ""
                     if ok:
-                        log.info("  ✓ Delivered")
+                        log.info("  ✓ Delivered %ssend=%dms", age_str, send_ms)
                     else:
-                        log.warning("  ✗ Failed")
+                        log.warning("  ✗ Failed %ssend=%dms", age_str, send_ms)
 
         except aiomqtt.MqttError as e:
             log.warning("MQTT disconnected: %s — reconnecting in %ds", e, retry_delay)
