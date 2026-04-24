@@ -33,32 +33,70 @@ APNS_HOST = {
 
 
 class WorkerSender:
-    """Sends events to the Cloudflare Worker which handles APNs delivery."""
+    """Sends events to one or more Cloudflare Worker webhook URLs.
 
-    def __init__(self, push_url: str):
-        self.push_url = push_url
+    Accepts a list of URLs so a single Frigate event fans out to every
+    registered device. Typical use: one URL per Lumen install
+    (iPhone + iPad + Mac + Apple Watch + Vision Pro). Filters and cooldown
+    run once *before* fan-out, so each event produces at most one push per
+    device regardless of how many URLs are configured.
+    """
+
+    def __init__(self, push_urls: list[str]):
+        if not push_urls:
+            raise ValueError("WorkerSender requires at least one URL")
+        self.push_urls = list(push_urls)
         self._client = httpx.AsyncClient(timeout=10)
 
-    async def send(self, event: dict) -> bool:
-        """POST a Frigate event payload to the Worker. Returns True on success."""
-        # The Worker expects the same format as Frigate MQTT: {"type":"new","after":{...}}
-        payload = {"type": "new", "before": None, "after": event}
+    async def _send_one(self, url: str, payload: dict) -> bool:
         try:
             resp = await self._client.post(
-                self.push_url,
+                url,
                 json=payload,
                 headers={"Content-Type": "application/json"},
             )
             if resp.status_code == 200:
                 return True
-            log.error("Worker error %d: %s", resp.status_code, resp.text)
+            log.error("Worker error %d for %s: %s", resp.status_code, _mask_url(url), resp.text)
             return False
         except Exception as e:
-            log.error("Worker request failed: %s", e)
+            log.error("Worker request failed for %s: %s", _mask_url(url), e)
             return False
+
+    async def send(self, event: dict) -> bool:
+        """POST a Frigate event payload to every configured Worker URL.
+
+        Returns True if at least one URL accepted the payload — that
+        matches the prior single-URL semantics so the main loop's
+        ok/fail logging stays meaningful.
+        """
+        # The Worker expects the same format as Frigate MQTT: {"type":"new","after":{...}}
+        payload = {"type": "new", "before": None, "after": event}
+        results = await asyncio.gather(
+            *(self._send_one(url, payload) for url in self.push_urls),
+            return_exceptions=False,
+        )
+        delivered = sum(1 for ok in results if ok)
+        if delivered < len(self.push_urls):
+            log.warning("Fan-out partial: %d/%d URLs delivered", delivered, len(self.push_urls))
+        return delivered > 0
 
     async def close(self):
         await self._client.aclose()
+
+
+def _mask_url(url: str) -> str:
+    """Redact the secret+token portion of a webhook URL for logs."""
+    # Shape: https://host/v1/notify/{secret}/{token} — keep host + prefix + last 6
+    try:
+        parts = url.split("/")
+        if len(parts) >= 7:
+            tail = parts[-1]
+            redacted_tail = "…" + tail[-6:] if len(tail) > 6 else tail
+            return "/".join(parts[:-2]) + "/…/" + redacted_tail
+    except Exception:
+        pass
+    return url[:40] + "…"
 
 
 class DirectAPNsSender:
@@ -263,6 +301,34 @@ def get_zone_message(event: dict, config: dict) -> dict | None:
     return None
 
 
+def _collect_push_urls_from_env() -> list[str]:
+    """Return the list of worker URLs configured via env vars.
+
+    Priority: PUSH_URLS (csv) overrides everything; otherwise PUSH_URL +
+    PUSH_URL_2..PUSH_URL_N are concatenated in numeric order. Preserves
+    order and drops duplicates / empties so the fan-out is predictable.
+    """
+    raw_csv = os.environ.get("PUSH_URLS", "").strip()
+    if raw_csv:
+        candidates = [u.strip() for u in raw_csv.split(",")]
+    else:
+        candidates = []
+        if base := os.environ.get("PUSH_URL"):
+            candidates.append(base.strip())
+        # PUSH_URL_2, PUSH_URL_3, ... — accept a reasonable ceiling
+        for n in range(2, 33):
+            if extra := os.environ.get(f"PUSH_URL_{n}"):
+                candidates.append(extra.strip())
+
+    seen = set()
+    ordered: list[str] = []
+    for u in candidates:
+        if u and u not in seen:
+            seen.add(u)
+            ordered.append(u)
+    return ordered
+
+
 def load_config() -> dict:
     """Load config from file or environment variables."""
     # Check for config file
@@ -287,11 +353,16 @@ def load_config() -> dict:
         },
     }
 
-    # Worker mode (recommended)
-    push_url = os.environ.get("PUSH_URL")
-    if push_url:
+    # Worker mode (recommended).
+    #
+    # Accepts:
+    #   PUSH_URL            (single URL — keeps pre-1.2 behaviour)
+    #   PUSH_URL_2, ..._N   (additional URLs — one per device, e.g. Watch)
+    #   PUSH_URLS           (comma-separated list; takes precedence if set)
+    push_urls = _collect_push_urls_from_env()
+    if push_urls:
         config["mode"] = "worker"
-        config["worker"] = {"push_url": push_url}
+        config["worker"] = {"push_urls": push_urls}
     else:
         # Direct mode
         config["mode"] = "direct"
@@ -315,16 +386,26 @@ async def run():
     frigate_cfg = config["frigate"]
     cooldown_sec = config.get("filters", {}).get("cooldown_seconds", 120)
 
-    # Determine mode
+    # Determine mode. Config files may specify either `worker.push_urls`
+    # (list, new) or the legacy `worker.push_url` (single). Env vars flow
+    # through load_config() and always produce the list form.
     mode = config.get("mode", "direct")
-    push_url = config.get("worker", {}).get("push_url")
+    worker_cfg = config.get("worker", {})
+    push_urls = worker_cfg.get("push_urls") or (
+        [worker_cfg["push_url"]] if worker_cfg.get("push_url") else []
+    )
 
-    if push_url or mode == "worker":
-        if not push_url:
-            log.error("Worker mode requires PUSH_URL — exiting")
+    if push_urls or mode == "worker":
+        if not push_urls:
+            log.error("Worker mode requires PUSH_URL (or PUSH_URLS / PUSH_URL_2..N) — exiting")
             return
-        sender = WorkerSender(push_url)
-        log.info("Mode: WORKER → %s", push_url[:60] + "...")
+        sender = WorkerSender(push_urls)
+        log.info(
+            "Mode: WORKER → %d URL%s [%s]",
+            len(push_urls),
+            "" if len(push_urls) == 1 else "s",
+            ", ".join(_mask_url(u) for u in push_urls),
+        )
     else:
         apns_cfg = config["apns"]
         devices = [d["token"] for d in config.get("devices", [])]

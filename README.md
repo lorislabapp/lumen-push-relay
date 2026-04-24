@@ -76,6 +76,33 @@ services:
     #   - ./config.yaml:/config/config.yaml
 ```
 
+## Multi-device fan-out (iPhone + Apple Watch, iPad, Mac, Vision Pro)
+
+Each Lumen install gives you its own **Copy URL** button — one per device. The relay fans every Frigate event out to every URL you give it, so you get a push on every device simultaneously. Filters and cooldown run **once** before fan-out, so you still get at most one push per event regardless of how many devices are configured.
+
+**The standalone Apple Watch app** (watchOS 11+) uses this to receive Frigate push directly over cellular, even with the paired iPhone out of range or powered off.
+
+Add additional URLs with `PUSH_URL_2`, `PUSH_URL_3`, … (up to 32), or pass a comma-separated list via `PUSH_URLS`:
+
+```yaml
+services:
+  lumen-push-relay:
+    image: lorislabapp/lumen-push-relay:latest
+    environment:
+      MQTT_HOST: "192.168.1.50"
+      PUSH_URL:   "https://lumen-push.mail5491.workers.dev/v1/notify/SECRET_A/TOKEN_IPHONE"
+      PUSH_URL_2: "https://lumen-push.mail5491.workers.dev/v1/notify/SECRET_B/TOKEN_WATCH"
+      # PUSH_URL_3: "…/TOKEN_MAC"
+```
+
+Or a single variable:
+
+```yaml
+      PUSH_URLS: "URL_IPHONE,URL_WATCH,URL_MAC"
+```
+
+`PUSH_URLS` takes precedence if both forms are set.
+
 ## Per-camera rules (advanced)
 
 For zone filtering, schedules, custom messages, and per-camera overrides, mount a `config.yaml` at `/config/config.yaml`. See [`config.yaml.example`](config.yaml.example) for the full schema.
