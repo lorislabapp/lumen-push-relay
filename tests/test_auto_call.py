@@ -167,3 +167,68 @@ def test_voip_dispatcher_payload_shape():
         assert body["aps"]["content-available"] == 1
     finally:
         httpx.Client.post = orig  # type: ignore
+
+
+# --- Phase 2.C: REST sync endpoint -----------------------------------------
+
+import asyncio
+from aiohttp import web
+from aiohttp.test_utils import TestServer, TestClient
+from src.auto_call.sync_endpoint import make_app, _atomic_write_json, _load_existing
+
+
+def test_atomic_write_and_load(tmp_path):
+    path = tmp_path / "configs.json"
+    _atomic_write_json(str(path), {"tok": {"cameras": {}}})
+    assert _load_existing(str(path)) == {"tok": {"cameras": {}}}
+
+
+def test_atomic_write_overwrites(tmp_path):
+    path = tmp_path / "configs.json"
+    _atomic_write_json(str(path), {"v1": 1})
+    _atomic_write_json(str(path), {"v2": 2})
+    assert _load_existing(str(path)) == {"v2": 2}
+
+
+@pytest.mark.asyncio
+async def test_sync_endpoint_writes_payload(tmp_path, monkeypatch):
+    cfg_path = tmp_path / "configs.json"
+    monkeypatch.setenv("LUMEN_AUTOCALL_CONFIG_PATH", str(cfg_path))
+    # Re-import the module so it picks up the env var.
+    import importlib
+    import src.auto_call.sync_endpoint as m
+    importlib.reload(m)
+
+    app = m.make_app()
+    async with TestClient(TestServer(app)) as client:
+        body = {
+            "voipToken": "deadbeef",
+            "cameras": {"front_door": {"enabled": True}},
+            "serverURL": "http://10.0.0.1:5000",
+        }
+        resp = await client.post("/auto-call/sync", json=body)
+        assert resp.status == 200
+        json_resp = await resp.json()
+        assert json_resp["ok"] is True
+
+    saved = json.loads(cfg_path.read_text())
+    assert "deadbeef" in saved
+    assert saved["deadbeef"]["serverURL"] == "http://10.0.0.1:5000"
+
+
+@pytest.mark.asyncio
+async def test_sync_endpoint_rejects_missing_voipToken(tmp_path, monkeypatch):
+    monkeypatch.setenv("LUMEN_AUTOCALL_CONFIG_PATH", str(tmp_path / "x.json"))
+    import importlib
+    import src.auto_call.sync_endpoint as m
+    importlib.reload(m)
+    async with TestClient(TestServer(m.make_app())) as client:
+        resp = await client.post("/auto-call/sync", json={"cameras": {}})
+        assert resp.status == 400
+
+
+@pytest.mark.asyncio
+async def test_health_endpoint(tmp_path):
+    async with TestClient(TestServer(make_app())) as client:
+        resp = await client.get("/auto-call/health")
+        assert resp.status == 200
