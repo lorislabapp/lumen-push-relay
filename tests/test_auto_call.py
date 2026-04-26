@@ -242,6 +242,35 @@ async def test_health_endpoint(tmp_path):
         assert resp.status == 200
 
 
+@pytest.mark.asyncio
+async def test_test_push_endpoint_rejects_missing_token(tmp_path, monkeypatch):
+    monkeypatch.setenv("LUMEN_AUTOCALL_CONFIG_PATH", str(tmp_path / "x.json"))
+    import importlib, src.auto_call.sync_endpoint as m
+    importlib.reload(m)
+    async with TestClient(TestServer(m.make_app())) as client:
+        resp = await client.post("/auto-call/test-push", json={})
+        assert resp.status == 400
+        body = await resp.json()
+        assert body["ok"] is False
+        assert "missing_voip_token" in body["error"]
+
+
+@pytest.mark.asyncio
+async def test_test_push_endpoint_returns_500_when_signer_unconfigured(tmp_path, monkeypatch):
+    monkeypatch.setenv("LUMEN_AUTOCALL_CONFIG_PATH", str(tmp_path / "x.json"))
+    # Remove any APNS env vars so signer init fails cleanly.
+    for var in ["APNS_TEAM_ID", "APNS_KEY_ID", "APNS_KEY_FILE", "APNS_KEY_PATH"]:
+        monkeypatch.delenv(var, raising=False)
+    import importlib, src.auto_call.sync_endpoint as m
+    importlib.reload(m)
+    async with TestClient(TestServer(m.make_app())) as client:
+        resp = await client.post("/auto-call/test-push", json={"voipToken": "abc"})
+        assert resp.status == 500
+        body = await resp.json()
+        assert body["ok"] is False
+        assert "apns_signer_init_failed" in body["error"]
+
+
 # --- Phase 2.D: shared JWT signer ------------------------------------------
 
 

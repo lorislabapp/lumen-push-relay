@@ -91,9 +91,58 @@ async def handle_health(request: web.Request) -> web.Response:
     return web.json_response({"status": "ok", "service": "lumen-auto-call-sync"})
 
 
+async def handle_test_push(request: web.Request) -> web.Response:
+    """Dispatch a single fake VoIP push to a specified token. Debug only.
+
+    Expects POST body:
+        {"voipToken": "<hex>",
+         "cameraId": "test_camera",          # optional
+         "displayName": "Test Caller"}        # optional
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
+
+    voip_token = body.get("voipToken")
+    if not isinstance(voip_token, str) or not voip_token:
+        return web.json_response({"ok": False, "error": "missing_voip_token"}, status=400)
+
+    camera_id = body.get("cameraId", "test_camera")
+    display_name = body.get("displayName", "Test Caller")
+
+    # Lazy import to avoid circular references / import-time env-var requirements.
+    from .apns_jwt import APNsJWTSigner
+    from .voip_dispatcher import VoIPDispatcher
+
+    try:
+        signer = APNsJWTSigner.from_env()
+    except (KeyError, OSError, FileNotFoundError) as e:
+        return web.json_response(
+            {"ok": False, "error": f"apns_signer_init_failed: {e}"},
+            status=500,
+        )
+
+    dispatcher = VoIPDispatcher(jwt_provider=signer.token)
+    try:
+        ok = await dispatcher.dispatch(
+            device_token_hex=voip_token,
+            camera_id=camera_id,
+            camera_display_name=display_name,
+            snapshot_url=None,
+            event_id="test-event",
+            trigger_type="test",
+        )
+    finally:
+        await dispatcher.aclose()
+
+    return web.json_response({"ok": ok, "dispatched": ok})
+
+
 def make_app() -> web.Application:
     app = web.Application()
     app.router.add_post("/auto-call/sync", handle_sync)
+    app.router.add_post("/auto-call/test-push", handle_test_push)
     app.router.add_get("/auto-call/health", handle_health)
     return app
 
