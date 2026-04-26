@@ -19,7 +19,7 @@ class TriggerEngine:
         self._dispatcher = dispatcher
         self._cooldown = cooldown
 
-    def handle_event(self, event: dict) -> int:
+    async def handle_event(self, event: dict) -> int:
         """Returns the number of VoIP pushes dispatched."""
         # Refresh config in case the file changed.
         self._config.reload()
@@ -30,7 +30,7 @@ class TriggerEngine:
                 logger.info("auto_call: cooldown hot, skipping camera=%s token=%s...", camera, token_cfg.voip_token[:10])
                 continue
             snapshot_url = self._compose_snapshot_url(token_cfg, camera, event)
-            ok = self._dispatcher.dispatch(
+            ok = await self._dispatcher.dispatch(
                 device_token_hex=token_cfg.voip_token,
                 camera_id=camera,
                 camera_display_name=camera,  # display name = id for v1 (app reads its own override)

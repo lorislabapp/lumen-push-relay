@@ -3,7 +3,6 @@ import json
 import os
 import tempfile
 import time
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -100,7 +99,7 @@ def test_config_filters_by_zone():
     os.unlink(path)
 
 
-def test_trigger_engine_dispatches_and_marks_cooldown():
+async def test_trigger_engine_dispatches_and_marks_cooldown():
     path = make_config_file({
         "tok": {
             "voipToken": "tok",
@@ -111,44 +110,52 @@ def test_trigger_engine_dispatches_and_marks_cooldown():
     })
     config = ConfigStore(path=path)
     cooldown = CooldownStore()
-    dispatcher = MagicMock(spec=VoIPDispatcher)
-    dispatcher.dispatch.return_value = True
+
+    class FakeDispatcher:
+        def __init__(self):
+            self.calls = 0
+
+        async def dispatch(self, **kwargs):
+            self.calls += 1
+            return True
+
+    dispatcher = FakeDispatcher()
     engine = TriggerEngine(config=config, dispatcher=dispatcher, cooldown=cooldown)
 
     event = {"camera": "front_door", "label": "person", "top_score": 0.9, "current_zones": [], "id": "evt-1"}
 
     # First event dispatches
-    assert engine.handle_event(event) == 1
-    assert dispatcher.dispatch.call_count == 1
+    assert await engine.handle_event(event) == 1
+    assert dispatcher.calls == 1
 
     # Second event within cooldown is suppressed
-    assert engine.handle_event(event) == 0
-    assert dispatcher.dispatch.call_count == 1
+    assert await engine.handle_event(event) == 0
+    assert dispatcher.calls == 1
 
     os.unlink(path)
 
 
-def test_voip_dispatcher_payload_shape():
+async def test_voip_dispatcher_payload_shape():
     """Smoke test that headers + body are constructed correctly."""
-    # Mock httpx by monkeypatching the Client.post on the instance.
+    # Mock httpx.AsyncClient.post by monkeypatching the class method.
     captured = {}
 
     class FakeResp:
         status_code = 200
         text = ""
 
-    def fake_post(self, url, headers=None, content=None):
+    async def fake_post(self, url, headers=None, content=None):
         captured["url"] = url
         captured["headers"] = headers
         captured["content"] = content
         return FakeResp()
 
     import httpx
-    orig = httpx.Client.post
-    httpx.Client.post = fake_post  # type: ignore
+    orig = httpx.AsyncClient.post
+    httpx.AsyncClient.post = fake_post  # type: ignore
+    dispatcher = VoIPDispatcher(jwt_provider=lambda: "FAKE.JWT")
     try:
-        dispatcher = VoIPDispatcher(jwt_provider=lambda: "FAKE.JWT")
-        ok = dispatcher.dispatch(
+        ok = await dispatcher.dispatch(
             device_token_hex="abc123",
             camera_id="front_door",
             camera_display_name="Front Door",
@@ -166,7 +173,8 @@ def test_voip_dispatcher_payload_shape():
         assert body["eventId"] == "evt-1"
         assert body["aps"]["content-available"] == 1
     finally:
-        httpx.Client.post = orig  # type: ignore
+        httpx.AsyncClient.post = orig  # type: ignore
+        await dispatcher.aclose()
 
 
 # --- Phase 2.C: REST sync endpoint -----------------------------------------
@@ -232,3 +240,30 @@ async def test_health_endpoint(tmp_path):
     async with TestClient(TestServer(make_app())) as client:
         resp = await client.get("/auto-call/health")
         assert resp.status == 200
+
+
+# --- Phase 2.D: shared JWT signer ------------------------------------------
+
+
+def test_apns_jwt_signer_caches():
+    """Signer caches a token for the cache_seconds window, then refreshes."""
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives import serialization
+
+    key = ec.generate_private_key(ec.SECP256R1())
+    pem = key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode()
+
+    from src.auto_call.apns_jwt import APNsJWTSigner
+    signer = APNsJWTSigner(team_id="TEAM", key_id="KID", private_key_pem=pem, cache_seconds=10)
+    t1 = signer.token()
+    t2 = signer.token()
+    assert t1 == t2  # cache hit
+    # Force expiry; token should regenerate (can't assert inequality because
+    # iat at second granularity may match if called in the same second).
+    signer._cached_at = 0
+    t3 = signer.token()
+    assert t3

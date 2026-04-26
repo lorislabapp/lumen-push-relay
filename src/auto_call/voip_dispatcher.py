@@ -1,8 +1,9 @@
-"""APNs VoIP push dispatcher.
+"""APNs VoIP push dispatcher (async).
 
-Reuses the existing .p8 JWT signing logic (see DirectAPNsSender._get_token in
-relay.py — the JWT provider here is any callable returning a current bearer
-JWT string). The only differences from regular pushes:
+Reuses the existing .p8 JWT signing logic (see APNsJWTSigner — extracted from
+DirectAPNsSender._get_token in relay.py). The jwt_provider is any callable
+returning a current bearer JWT string. The only differences from regular
+pushes:
   - apns-topic: <bundleID>.voip  (suffix .voip)
   - apns-push-type: voip
   - apns-priority: 10
@@ -23,12 +24,16 @@ APNS_HOST = os.environ.get("APNS_HOST", "https://api.push.apple.com")  # use api
 
 class VoIPDispatcher:
     def __init__(self, jwt_provider) -> None:
-        """jwt_provider is a callable returning the current JWT string. Re-use whatever
-        the existing relay.py uses for direct-mode APNs sends."""
-        self._jwt_provider = jwt_provider
-        self._client = httpx.Client(http2=True, timeout=5.0)
+        """jwt_provider is a callable returning the current JWT string (sync, fast).
 
-    def dispatch(
+        Use APNsJWTSigner.token (or a lambda wrapping it) to share signing with
+        DirectAPNsSender. Works equally well in worker mode (where the regular
+        sender is a WorkerSender) — VoIP always goes direct to Apple.
+        """
+        self._jwt_provider = jwt_provider
+        self._client = httpx.AsyncClient(http2=True, timeout=5.0)
+
+    async def dispatch(
         self,
         device_token_hex: str,
         camera_id: str,
@@ -59,7 +64,7 @@ class VoIPDispatcher:
             "content-type": "application/json",
         }
         try:
-            r = self._client.post(url, headers=headers, content=json.dumps(payload).encode())
+            r = await self._client.post(url, headers=headers, content=json.dumps(payload).encode())
         except Exception as e:
             logger.error("VoIP dispatch failed (network): %s", e)
             return False
@@ -68,3 +73,6 @@ class VoIPDispatcher:
             return True
         logger.warning("VoIP dispatch HTTP %d body=%s", r.status_code, r.text[:200])
         return False
+
+    async def aclose(self) -> None:
+        await self._client.aclose()

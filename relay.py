@@ -18,6 +18,10 @@ import aiomqtt
 import httpx
 import yaml
 
+from src.auto_call import ConfigStore, CooldownStore, TriggerEngine, VoIPDispatcher
+from src.auto_call.apns_jwt import APNsJWTSigner
+from src.auto_call.sync_endpoint import start_sync_server
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -102,32 +106,27 @@ def _mask_url(url: str) -> str:
 class DirectAPNsSender:
     """Sends push notifications directly via Apple's HTTP/2 APNs API."""
 
-    def __init__(self, key_file: str, key_id: str, team_id: str, bundle_id: str, environment: str, device_tokens: list[str]):
-        import jwt as pyjwt
-        self._pyjwt = pyjwt
+    def __init__(self, key_file: str, key_id: str, team_id: str, bundle_id: str, environment: str, device_tokens: list[str], signer: "APNsJWTSigner | None" = None):
+        # JWT signing is delegated to APNsJWTSigner (shared with VoIPDispatcher).
+        # Accept an optional pre-built signer so the auto-call subsystem and the
+        # main alert path use the same .p8/key_id/team_id without loading the
+        # file twice.
         self.key_id = key_id
         self.team_id = team_id
         self.bundle_id = bundle_id
         self.host = APNS_HOST[environment]
-        self.private_key = Path(key_file).read_text()
+        if signer is None:
+            private_key = Path(key_file).read_text()
+            signer = APNsJWTSigner(team_id=team_id, key_id=key_id, private_key_pem=private_key)
+        self._signer = signer
         self.device_tokens = device_tokens
-        self._token: str | None = None
-        self._token_time: float = 0
         self._client = httpx.AsyncClient(http2=True, timeout=10)
 
     def _get_token(self) -> str:
-        now = time.time()
-        if self._token and (now - self._token_time) < 3000:
-            return self._token
-        self._token = self._pyjwt.encode(
-            {"iss": self.team_id, "iat": int(now)},
-            self.private_key,
-            algorithm="ES256",
-            headers={"kid": self.key_id},
-        )
-        self._token_time = now
-        log.info("Refreshed APNs JWT token")
-        return self._token
+        # Backward-compatible wrapper around the shared signer. Kept so
+        # external callers (or older tests) that referenced this method
+        # continue to work; the signer caches internally.
+        return self._signer.token()
 
     async def send(self, event: dict) -> bool:
         payload = build_apns_payload(event)
@@ -424,6 +423,52 @@ async def run():
 
     cooldown = CooldownTracker(cooldown_sec)
 
+    # ---- Auto-call (Doorbell Call Mode) -----------------------------------
+    # Phase 2.D: optional VoIP push pipeline. Always-additive — never blocks
+    # the regular alert path. Disabled if APNs creds aren't available, since
+    # VoIP must go direct to api.push.apple.com (no Worker proxy).
+    engine: TriggerEngine | None = None
+    voip_dispatcher: VoIPDispatcher | None = None
+    sync_runner = None  # aiohttp AppRunner
+
+    autocall_enabled = os.environ.get("LUMEN_AUTOCALL_ENABLED", "true").lower() not in ("0", "false", "no")
+    if autocall_enabled:
+        try:
+            # Reuse the DirectAPNsSender's signer if we built one above; else
+            # try to construct one from env. This is what makes auto-call work
+            # in worker mode too — the worker doesn't sign, but we do for VoIP.
+            signer: APNsJWTSigner | None = None
+            if isinstance(sender, DirectAPNsSender):
+                signer = sender._signer
+            else:
+                try:
+                    signer = APNsJWTSigner.from_env()
+                except (KeyError, OSError) as e:
+                    log.warning(
+                        "auto_call: cannot load APNs signer (%s) — VoIP pushes disabled. "
+                        "Set APNS_TEAM_ID / APNS_KEY_ID / APNS_KEY_FILE to enable.", e,
+                    )
+                    signer = None
+
+            if signer is not None:
+                voip_dispatcher = VoIPDispatcher(jwt_provider=signer.token)
+                config_store = ConfigStore()
+                cooldown_store = CooldownStore()
+                engine = TriggerEngine(config=config_store, dispatcher=voip_dispatcher, cooldown=cooldown_store)
+
+                sync_host = os.environ.get("LUMEN_AUTOCALL_SYNC_HOST", "0.0.0.0")
+                sync_port = int(os.environ.get("LUMEN_AUTOCALL_SYNC_PORT", "8765"))
+                sync_runner = await start_sync_server(host=sync_host, port=sync_port)
+                log.info("auto_call: engine ready, sync REST endpoint on %s:%d", sync_host, sync_port)
+        except Exception as e:
+            # Auto-call must NEVER break the relay — log loudly and carry on.
+            log.error("auto_call: failed to initialise (%s) — continuing without VoIP pipeline", e)
+            engine = None
+            voip_dispatcher = None
+            sync_runner = None
+    else:
+        log.info("auto_call: disabled via LUMEN_AUTOCALL_ENABLED")
+
     log.info(
         "Connecting to MQTT %s:%d topic=%s",
         frigate_cfg["mqtt_host"],
@@ -460,6 +505,18 @@ async def run():
                     event = data.get("after") or data.get("before")
                     if not event:
                         continue
+
+                    # Auto-call (Doorbell Call Mode) runs on every parsed event,
+                    # independently of the alert pipeline. Its own filters
+                    # (min_score, required_zone, required_objects, schedule,
+                    # cooldown) live in AutoCallConfig per device+camera. We
+                    # swallow ALL exceptions — auto-call must never silence
+                    # regular notifications.
+                    if engine is not None:
+                        try:
+                            await engine.handle_event(event)
+                        except Exception as e:
+                            log.error("auto_call.handle_event failed: %s", e)
 
                     camera = event.get("camera", "?")
                     label = event.get("label", "?")
@@ -507,7 +564,14 @@ async def run():
         await asyncio.sleep(retry_delay)
         retry_delay = min(retry_delay * 2, 30)
 
+    # Cleanup is unreachable in practice (the loop above never exits) but
+    # documents intent: when the process is killed, close the HTTP/2 client,
+    # the auto-call dispatcher, and tear down the aiohttp sync server.
     await sender.close()
+    if voip_dispatcher is not None:
+        await voip_dispatcher.aclose()
+    if sync_runner is not None:
+        await sync_runner.cleanup()
 
 
 if __name__ == "__main__":

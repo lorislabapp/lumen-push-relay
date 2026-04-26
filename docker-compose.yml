@@ -5,6 +5,10 @@ services:
     # build: .
     container_name: lumen-push-relay
     restart: unless-stopped
+    # Auto-call REST sync endpoint (Doorbell Call Mode). Comment out if you
+    # don't want the iOS app to be able to push AutoCallConfig to the relay.
+    ports:
+      - "8765:8765"
     environment:
       # --- Required: your Frigate MQTT broker ---
       MQTT_HOST: "192.168.1.50"         # change to your Frigate/MQTT IP

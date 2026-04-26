@@ -170,6 +170,22 @@ Set `mode: worker` (default) or `mode: direct` in `config.yaml`, or omit `PUSH_U
 | `APNS_ENVIRONMENT` | `production` or `sandbox` |
 | `DEVICE_TOKENS` | Comma-separated device tokens |
 
+### Auto-call (Doorbell Call Mode)
+
+The relay can deliver VoIP pushes that ring an iPhone like a phone call when a
+person enters a configured zone. VoIP must go direct to APNs (no Worker proxy),
+so the auto-call pipeline only activates when an APNs `.p8` is available — same
+credentials as `direct` mode, but it works alongside `worker` mode for regular
+notifications. Disable by setting `LUMEN_AUTOCALL_ENABLED=false`.
+
+| Variable | Default | Description |
+|---|---|---|
+| `LUMEN_AUTOCALL_ENABLED` | `true` | Master switch for the auto-call pipeline |
+| `LUMEN_AUTOCALL_SYNC_HOST` | `0.0.0.0` | Host the `/auto-call/sync` REST endpoint binds to |
+| `LUMEN_AUTOCALL_SYNC_PORT` | `8765` | Port the `/auto-call/sync` REST endpoint listens on |
+| `LUMEN_AUTOCALL_CONFIG_PATH` | `/var/lib/lumen-push-relay/auto_call_configs.json` | Where the relay persists per-device AutoCallConfig |
+| `APP_BUNDLE_ID` | `com.lorislab.lumenforfrigate.Lumen-for-Frigate` | App bundle ID (the VoIP topic is `<bundleId>.voip`) |
+
 ## Troubleshooting
 
 **No notifications**  
