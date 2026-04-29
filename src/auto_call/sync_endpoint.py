@@ -1,21 +1,21 @@
 """HTTP endpoint that the iOS app POSTs auto-call configs to.
 
-Atomically writes to the file backing ConfigStore.
-
-Usage from relay.py main loop:
-
-    from src.auto_call.sync_endpoint import start_sync_server
-    runner = await start_sync_server(host="0.0.0.0", port=8765)
-    # ... run forever
-    await runner.cleanup()
+Endpoints:
+  POST /auto-call/sync       — full upsert of one device's configs + buttons
+  POST /auto-call/test-push  — debug VoIP push for editor "Test" button
+  GET  /auto-call/discover   — list HA-discovered button-shaped entities
+  GET  /auto-call/health     — health probe
 """
+import asyncio
 import json
 import logging
 import os
 import tempfile
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from aiohttp import web
+
+from .discovery.cache import DiscoveryCache
 
 logger = logging.getLogger("lumen.auto_call.sync")
 
@@ -62,6 +62,13 @@ async def handle_sync(request: web.Request) -> web.Response:
     if not isinstance(cameras, dict):
         return web.json_response({"error": "missing_cameras"}, status=400)
 
+    # buttons is optional; default to empty list for back-compat with v1 clients.
+    buttons = body.get("buttons")
+    if buttons is None:
+        buttons = []
+    elif not isinstance(buttons, list):
+        return web.json_response({"error": "buttons_must_be_array"}, status=400)
+
     server_url = body.get("serverURL")
     auth_header = body.get("authHeader")
 
@@ -71,6 +78,7 @@ async def handle_sync(request: web.Request) -> web.Response:
         "serverURL": server_url,
         "authHeader": auth_header,
         "cameras": cameras,
+        "buttons": buttons,
     }
     try:
         _atomic_write_json(CONFIG_PATH, existing)
@@ -78,13 +86,24 @@ async def handle_sync(request: web.Request) -> web.Response:
         logger.error("atomic write failed: %s", e)
         return web.json_response({"error": "write_failed"}, status=500)
 
+    # Schedule a reconcile pass so SubscriptionManager picks up new/removed
+    # button topics within milliseconds of the save (don't wait for mtime poll).
+    queue: Optional[asyncio.Queue] = request.app.get("subs_reconcile_queue")
+    if queue is not None:
+        try:
+            queue.put_nowait("reload")
+        except asyncio.QueueFull:
+            pass  # already-pending reconcile is sufficient
+
     logger.info(
-        "auto_call sync: token=%s... cameras=%s server=%s",
-        voip_token[:10],
-        list(cameras.keys()),
-        server_url,
+        "auto_call sync: token=%s... cameras=%s buttons=%d server=%s",
+        voip_token[:10], list(cameras.keys()), len(buttons), server_url,
     )
-    return web.json_response({"ok": True, "cameras": list(cameras.keys())})
+    return web.json_response({
+        "ok": True,
+        "cameras": list(cameras.keys()),
+        "buttons": len(buttons),
+    })
 
 
 async def handle_health(request: web.Request) -> web.Response:
@@ -92,13 +111,7 @@ async def handle_health(request: web.Request) -> web.Response:
 
 
 async def handle_test_push(request: web.Request) -> web.Response:
-    """Dispatch a single fake VoIP push to a specified token. Debug only.
-
-    Expects POST body:
-        {"voipToken": "<hex>",
-         "cameraId": "test_camera",          # optional
-         "displayName": "Test Caller"}        # optional
-    """
+    """Dispatch a single fake VoIP push to a specified token. Debug only."""
     try:
         body = await request.json()
     except Exception:
@@ -111,7 +124,6 @@ async def handle_test_push(request: web.Request) -> web.Response:
     camera_id = body.get("cameraId", "test_camera")
     display_name = body.get("displayName", "Test Caller")
 
-    # Lazy import to avoid circular references / import-time env-var requirements.
     from .apns_jwt import APNsJWTSigner
     from .voip_dispatcher import VoIPDispatcher
 
@@ -119,19 +131,15 @@ async def handle_test_push(request: web.Request) -> web.Response:
         signer = APNsJWTSigner.from_env()
     except (KeyError, OSError, FileNotFoundError) as e:
         return web.json_response(
-            {"ok": False, "error": f"apns_signer_init_failed: {e}"},
-            status=500,
+            {"ok": False, "error": f"apns_signer_init_failed: {e}"}, status=500,
         )
 
     dispatcher = VoIPDispatcher(jwt_provider=signer.token)
     try:
         ok = await dispatcher.dispatch(
-            device_token_hex=voip_token,
-            camera_id=camera_id,
-            camera_display_name=display_name,
-            snapshot_url=None,
-            event_id="test-event",
-            trigger_type="test",
+            device_token_hex=voip_token, camera_id=camera_id,
+            camera_display_name=display_name, snapshot_url=None,
+            event_id="test-event", trigger_type="test",
         )
     finally:
         await dispatcher.aclose()
@@ -139,19 +147,47 @@ async def handle_test_push(request: web.Request) -> web.Response:
     return web.json_response({"ok": ok, "dispatched": ok})
 
 
-def make_app() -> web.Application:
+async def handle_discover(request: web.Request) -> web.Response:
+    """List HA-discovered button-shaped entities currently in the relay's cache."""
+    cache: Optional[DiscoveryCache] = request.app.get("discovery_cache")
+    if cache is None:
+        return web.json_response([], status=200)
+    return web.json_response([
+        {
+            "objectId": e.object_id,
+            "name": e.name,
+            "topic": e.topic,
+            "deviceClass": e.device_class,
+            "suggestedMatch": e.suggested_match,
+        }
+        for e in cache.list()
+    ])
+
+
+def make_app(
+    discovery_cache: Optional[DiscoveryCache] = None,
+    subs_reconcile_queue: Optional[asyncio.Queue] = None,
+) -> web.Application:
     app = web.Application()
+    app["discovery_cache"] = discovery_cache
+    app["subs_reconcile_queue"] = subs_reconcile_queue
     app.router.add_post("/auto-call/sync", handle_sync)
     app.router.add_post("/auto-call/test-push", handle_test_push)
+    app.router.add_get("/auto-call/discover", handle_discover)
     app.router.add_get("/auto-call/health", handle_health)
     return app
 
 
-async def start_sync_server(host: str = "0.0.0.0", port: int = 8765) -> web.AppRunner:
-    app = make_app()
+async def start_sync_server(
+    host: str = "0.0.0.0", port: int = 8765,
+    discovery_cache: Optional[DiscoveryCache] = None,
+    subs_reconcile_queue: Optional[asyncio.Queue] = None,
+) -> web.AppRunner:
+    app = make_app(discovery_cache=discovery_cache, subs_reconcile_queue=subs_reconcile_queue)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, host, port)
     await site.start()
-    logger.info("auto_call sync server listening on %s:%d", host, port)
+    logger.info("auto_call sync server listening on %s:%d (discovery=%s, queue=%s)",
+                host, port, discovery_cache is not None, subs_reconcile_queue is not None)
     return runner
