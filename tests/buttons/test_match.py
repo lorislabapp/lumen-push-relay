@@ -112,3 +112,30 @@ def test_unknown_pattern_type_returns_false(m):
 def test_payload_decode_invalid_utf8_replaces(m):
     # Invalid UTF-8 byte sequence — should not raise.
     assert m.matches(make_rule("any"), b"\xff\xfe\x00\xff")
+
+
+def test_regex_at_boundary_256_chars_passes(m):
+    # 256-char pattern is at the boundary, should compile and match.
+    pat = "a" * 256
+    assert m.matches(make_rule("regex", pat), b"a" * 256)
+
+
+def test_regex_at_boundary_257_chars_rejected(m):
+    # 257 chars is one over — must reject without attempting compile.
+    pat = "a" * 257
+    assert not m.matches(make_rule("regex", pat), b"a" * 257)
+
+
+def test_regex_oversized_target_rejected(m):
+    # Target longer than TARGET_MAX_LEN must short-circuit to False, not
+    # invoke .search() (defense-in-depth against payload-driven ReDoS).
+    huge = b"a" * 70000
+    assert not m.matches(make_rule("regex", ".*"), huge)
+
+
+def test_jsonpath_lone_dollar_returns_false(m):
+    # "$" alone is not a meaningful path — must reject rather than stringify root.
+    assert not m.matches(
+        make_rule("equals", "{'foo': 'bar'}", path="$"),
+        b'{"foo":"bar"}',
+    )

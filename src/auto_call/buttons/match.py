@@ -1,17 +1,21 @@
-"""ReDoS-safe match evaluator for physical-button MQTT payloads.
+"""Match evaluator for physical-button MQTT payloads.
 
 Supports three pattern types:
 - "any":    any message on the topic matches.
 - "equals": exact string equality (against full payload OR a JSONPath result).
-- "regex":  re.search on full payload OR JSONPath result. Length-capped to
-            REGEX_MAX_LEN; invalid patterns silently return False (cached).
+- "regex":  re.search on full payload OR JSONPath result. Length-capped on both
+            pattern (REGEX_MAX_LEN=256) and target (TARGET_MAX_LEN=65536); invalid
+            patterns silently return False (cached). Length cap is the v1 ReDoS
+            mitigation — a third-party `regex` package with timeout flag is the
+            v2 plan if pathological patterns become an issue.
 
 JSONPath subset (no external deps):
-- "$"             root
 - "$.foo"         dict key
 - "$.foo.bar"     nested key
 - "$.arr[0]"      array index
-No wildcards, no filters. If users want more, regex on full payload covers it.
+- "$.arr[0][1]"   nested array index
+No wildcards, no filters, no bracket-quoted keys. If users want more, regex
+on the full payload covers it. iOS-side validation must mirror this restriction.
 """
 import json
 import logging
@@ -23,6 +27,7 @@ from .models import MatchRule
 log = logging.getLogger("lumen.auto_call.buttons.match")
 
 REGEX_MAX_LEN = 256
+TARGET_MAX_LEN = 65536
 
 _TOKEN_RE = re.compile(r"\.([A-Za-z_][\w]*)|\[(\d+)\]")
 
@@ -34,6 +39,8 @@ def _eval_jsonpath(path: str, payload_text: str) -> Optional[str]:
     around primitives), or None if the path doesn't resolve.
     """
     if not path.startswith("$"):
+        return None
+    if path == "$":
         return None
     try:
         obj: Any = json.loads(payload_text)
@@ -99,6 +106,8 @@ class MatchEvaluator:
     def _regex_match(self, pattern: str, target: str) -> bool:
         if not pattern or len(pattern) > REGEX_MAX_LEN:
             return False
+        if len(target) > TARGET_MAX_LEN:
+            return False
         cached = self._cache.get(pattern)
         if cached is False:
             return False
@@ -112,6 +121,6 @@ class MatchEvaluator:
                 return False
         try:
             return bool(cached.search(target))
-        except Exception as e:
+        except re.error as e:
             log.debug("regex search raised on %r: %s", pattern, e)
             return False
