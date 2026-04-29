@@ -20,6 +20,9 @@ import yaml
 
 from src.auto_call import ConfigStore, CooldownStore, TriggerEngine, VoIPDispatcher
 from src.auto_call.apns_jwt import APNsJWTSigner
+from src.auto_call.buttons import ButtonEngine, MatchEvaluator
+from src.auto_call.discovery import DiscoveryCache
+from src.auto_call.mqtt import SubscriptionManager, TopicRouter
 from src.auto_call.sync_endpoint import start_sync_server
 
 logging.basicConfig(
@@ -384,6 +387,7 @@ async def run():
 
     frigate_cfg = config["frigate"]
     cooldown_sec = config.get("filters", {}).get("cooldown_seconds", 120)
+    ha_discovery_prefix = os.environ.get("LUMEN_HA_DISCOVERY_PREFIX", "homeassistant").strip("/")
 
     # Determine mode. Config files may specify either `worker.push_urls`
     # (list, new) or the legacy `worker.push_url` (single). Env vars flow
@@ -430,6 +434,11 @@ async def run():
     engine: TriggerEngine | None = None
     voip_dispatcher: VoIPDispatcher | None = None
     sync_runner = None  # aiohttp AppRunner
+    config_store: ConfigStore | None = None
+    cooldown_store: CooldownStore | None = None
+    discovery_cache: DiscoveryCache | None = None
+    button_engine: ButtonEngine | None = None
+    subs_reconcile_queue: asyncio.Queue | None = None
 
     autocall_enabled = os.environ.get("LUMEN_AUTOCALL_ENABLED", "true").lower() not in ("0", "false", "no")
     if autocall_enabled:
@@ -460,12 +469,37 @@ async def run():
                 sync_port = int(os.environ.get("LUMEN_AUTOCALL_SYNC_PORT", "8765"))
                 sync_runner = await start_sync_server(host=sync_host, port=sync_port)
                 log.info("auto_call: engine ready, sync REST endpoint on %s:%d", sync_host, sync_port)
+
+                # Wire ButtonEngine + DiscoveryCache into the sync server.
+                if engine is not None and config_store is not None and voip_dispatcher is not None:
+                    discovery_cache = DiscoveryCache()
+                    button_engine = ButtonEngine(
+                        config_store=config_store,
+                        dispatcher=voip_dispatcher,
+                        cooldown=cooldown_store,
+                    )
+                    subs_reconcile_queue = asyncio.Queue(maxsize=8)
+
+                    # Restart the sync server with discovery + reconcile-queue wired in.
+                    if sync_runner is not None:
+                        await sync_runner.cleanup()
+                    sync_runner = await start_sync_server(
+                        host=sync_host, port=sync_port,
+                        discovery_cache=discovery_cache,
+                        subs_reconcile_queue=subs_reconcile_queue,
+                    )
+                    log.info("auto_call: button engine + HA discovery wired (prefix=%s/)", ha_discovery_prefix)
         except Exception as e:
             # Auto-call must NEVER break the relay — log loudly and carry on.
             log.error("auto_call: failed to initialise (%s) — continuing without VoIP pipeline", e)
             engine = None
             voip_dispatcher = None
             sync_runner = None
+            config_store = None
+            cooldown_store = None
+            discovery_cache = None
+            button_engine = None
+            subs_reconcile_queue = None
     else:
         log.info("auto_call: disabled via LUMEN_AUTOCALL_ENABLED")
 
@@ -490,12 +524,53 @@ async def run():
 
             async with aiomqtt.Client(**mqtt_kwargs) as mqtt:
                 await mqtt.subscribe(frigate_cfg["topic"])
+                if discovery_cache is not None:
+                    await mqtt.subscribe(f"{ha_discovery_prefix}/+/+/config")
+
+                subs_manager: SubscriptionManager | None = None
+                if button_engine is not None and config_store is not None:
+                    subs_manager = SubscriptionManager(mqtt)
+                    await subs_manager.reconcile(config_store.all_button_topics())
+
+                async def _frigate_handler(topic: str, payload: bytes):
+                    return None  # Frigate handling stays inline below
+
+                router: TopicRouter | None = None
+                if button_engine is not None and discovery_cache is not None:
+                    router = TopicRouter(
+                        frigate_topic=frigate_cfg["topic"],
+                        ha_prefix=ha_discovery_prefix,
+                        frigate_handler=_frigate_handler,
+                        discovery_cache=discovery_cache,
+                        button_engine=button_engine,
+                    )
+
                 log.info("Connected to MQTT, listening for events...")
                 retry_delay = 1
 
                 async for message in mqtt.messages:
+                    topic_str = str(message.topic)
+                    payload_bytes = message.payload if isinstance(message.payload, (bytes, bytearray)) else bytes(message.payload or b"")
+
+                    # Drain any pending reconcile signals.
+                    if subs_manager is not None and config_store is not None and subs_reconcile_queue is not None:
+                        try:
+                            while True:
+                                subs_reconcile_queue.get_nowait()
+                                config_store.reload()
+                                await subs_manager.reconcile(config_store.all_button_topics())
+                        except asyncio.QueueEmpty:
+                            pass
+
+                    # Non-Frigate messages: route via TopicRouter (HA discovery + buttons).
+                    if topic_str != frigate_cfg["topic"]:
+                        if router is not None:
+                            await router.route(topic_str, payload_bytes)
+                        continue
+
+                    # Frigate path (existing — UNCHANGED below).
                     try:
-                        data = json.loads(message.payload)
+                        data = json.loads(payload_bytes)
                     except (json.JSONDecodeError, TypeError):
                         continue
 
