@@ -112,3 +112,33 @@ async def test_multiple_users_bound_to_same_topic():
     n = await eng.handle_message("test/btn", b"")
     assert n == 2
     assert {c["device_token_hex"] for c in disp.calls} == {"tok1", "tok2"}
+
+
+class FlakyDispatcher:
+    """First call raises, second call returns True. Used to validate that
+    one binding's dispatch failure does not abort the fan-out loop."""
+    def __init__(self):
+        self.calls: list[dict] = []
+    async def dispatch(self, **kw):
+        self.calls.append(kw)
+        if len(self.calls) == 1:
+            raise RuntimeError("simulated APNs blip")
+        return True
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_exception_does_not_halt_other_users():
+    cs = FakeConfigStore([
+        ("tok1", _binding(cameras=["front"])),
+        ("tok2", _binding(cameras=["front"])),
+    ])
+    disp, cd = FlakyDispatcher(), FakeCooldown()
+    eng = ButtonEngine(config_store=cs, dispatcher=disp, cooldown=cd)
+    n = await eng.handle_message("test/btn", b"")
+    # First call raised → not counted; second call succeeded → counted.
+    assert n == 1
+    # Both dispatch attempts ran (proves the exception was isolated to the failing call).
+    assert len(disp.calls) == 2
+    # Cooldown only marked hot for the user whose dispatch succeeded.
+    assert ("tok2", "front") in cd.hot
+    assert ("tok1", "front") not in cd.hot

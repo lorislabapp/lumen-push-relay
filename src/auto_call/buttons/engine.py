@@ -54,15 +54,25 @@ class ButtonEngine:
                     log.debug("buttons: cooldown hot token=%s... camera=%s",
                               token[:10], camera_id)
                     continue
-                ok = await self._dispatcher.dispatch(
-                    device_token_hex=token,
-                    camera_id=camera_id,
-                    camera_display_name=camera_id,
-                    snapshot_url=None,
-                    event_id=f"button-{binding.id}-{int(time.time())}",
-                    trigger_type="physicalButton",
-                )
+                try:
+                    ok = await self._dispatcher.dispatch(
+                        device_token_hex=token,
+                        camera_id=camera_id,
+                        camera_display_name=camera_id,
+                        snapshot_url=None,
+                        event_id=f"button-{binding.id}-{camera_id}-{int(time.time())}",
+                        trigger_type="physicalButton",
+                    )
+                except Exception:
+                    log.exception("buttons: dispatcher raised for token=%s... camera=%s",
+                                  token[:10], camera_id)
+                    continue
                 if ok:
+                    log.info("buttons: dispatched binding=%s camera=%s token=%s...",
+                             binding.id, camera_id, token[:10])
                     self._cooldown.mark_hot(token, camera_id)
                     dispatched += 1
+                else:
+                    log.warning("buttons: dispatch returned False for token=%s... camera=%s",
+                                token[:10], camera_id)
         return dispatched
