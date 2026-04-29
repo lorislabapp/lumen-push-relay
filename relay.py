@@ -465,30 +465,26 @@ async def run():
                 cooldown_store = CooldownStore()
                 engine = TriggerEngine(config=config_store, dispatcher=voip_dispatcher, cooldown=cooldown_store)
 
+                # Wire the button + discovery pipeline before starting the sync server,
+                # so handle_sync can access discovery_cache and subs_reconcile_queue
+                # from the very first request.
+                discovery_cache = DiscoveryCache()
+                button_engine = ButtonEngine(
+                    config_store=config_store,
+                    dispatcher=voip_dispatcher,
+                    cooldown=cooldown_store,
+                )
+                subs_reconcile_queue = asyncio.Queue(maxsize=8)
+
                 sync_host = os.environ.get("LUMEN_AUTOCALL_SYNC_HOST", "0.0.0.0")
                 sync_port = int(os.environ.get("LUMEN_AUTOCALL_SYNC_PORT", "8765"))
-                sync_runner = await start_sync_server(host=sync_host, port=sync_port)
+                sync_runner = await start_sync_server(
+                    host=sync_host, port=sync_port,
+                    discovery_cache=discovery_cache,
+                    subs_reconcile_queue=subs_reconcile_queue,
+                )
                 log.info("auto_call: engine ready, sync REST endpoint on %s:%d", sync_host, sync_port)
-
-                # Wire ButtonEngine + DiscoveryCache into the sync server.
-                if engine is not None and config_store is not None and voip_dispatcher is not None:
-                    discovery_cache = DiscoveryCache()
-                    button_engine = ButtonEngine(
-                        config_store=config_store,
-                        dispatcher=voip_dispatcher,
-                        cooldown=cooldown_store,
-                    )
-                    subs_reconcile_queue = asyncio.Queue(maxsize=8)
-
-                    # Restart the sync server with discovery + reconcile-queue wired in.
-                    if sync_runner is not None:
-                        await sync_runner.cleanup()
-                    sync_runner = await start_sync_server(
-                        host=sync_host, port=sync_port,
-                        discovery_cache=discovery_cache,
-                        subs_reconcile_queue=subs_reconcile_queue,
-                    )
-                    log.info("auto_call: button engine + HA discovery wired (prefix=%s/)", ha_discovery_prefix)
+                log.info("auto_call: button engine + HA discovery wired (prefix=%s/)", ha_discovery_prefix)
         except Exception as e:
             # Auto-call must NEVER break the relay — log loudly and carry on.
             log.error("auto_call: failed to initialise (%s) — continuing without VoIP pipeline", e)
@@ -527,13 +523,19 @@ async def run():
                 if discovery_cache is not None:
                     await mqtt.subscribe(f"{ha_discovery_prefix}/+/+/config")
 
+                # Fresh per MQTT connection — the broker session is gone on reconnect,
+                # so subscription state must restart from empty.
                 subs_manager: SubscriptionManager | None = None
                 if button_engine is not None and config_store is not None:
                     subs_manager = SubscriptionManager(mqtt)
                     await subs_manager.reconcile(config_store.all_button_topics())
 
                 async def _frigate_handler(topic: str, payload: bytes):
-                    return None  # Frigate handling stays inline below
+                    # Defensive guard: the message loop short-circuits Frigate-topic
+                    # messages BEFORE invoking the router, so this handler must never
+                    # run. If it does, our routing assumption is broken — fail loud
+                    # so it surfaces in logs (TopicRouter.route catches and logs).
+                    raise AssertionError("frigate path must run inline, not via TopicRouter")
 
                 router: TopicRouter | None = None
                 if button_engine is not None and discovery_cache is not None:
@@ -554,13 +556,16 @@ async def run():
 
                     # Drain any pending reconcile signals.
                     if subs_manager is not None and config_store is not None and subs_reconcile_queue is not None:
+                        drained = False
                         try:
                             while True:
                                 subs_reconcile_queue.get_nowait()
-                                config_store.reload()
-                                await subs_manager.reconcile(config_store.all_button_topics())
+                                drained = True
                         except asyncio.QueueEmpty:
                             pass
+                        if drained:
+                            config_store.reload()
+                            await subs_manager.reconcile(config_store.all_button_topics())
 
                     # Non-Frigate messages: route via TopicRouter (HA discovery + buttons).
                     if topic_str != frigate_cfg["topic"]:
