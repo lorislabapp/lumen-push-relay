@@ -25,6 +25,7 @@ from src.auto_call.discovery import DiscoveryCache
 from src.auto_call.mqtt import SubscriptionManager, TopicRouter
 from src.auto_call.sync_endpoint import start_sync_server
 from src.health_monitor import health_state
+from src.snapshot_compressor import fetch_and_compress_snapshot
 
 logging.basicConfig(
     level=logging.INFO,
@@ -347,6 +348,7 @@ def load_config() -> dict:
             "mqtt_user": os.environ.get("MQTT_USER"),
             "mqtt_password": os.environ.get("MQTT_PASSWORD"),
             "topic": os.environ.get("MQTT_TOPIC", "frigate/events"),
+            "url": os.environ.get("FRIGATE_URL"),  # HTTP API for snapshot fetch
         },
         "filters": {
             "labels": os.environ.get("FILTER_LABELS", "person,car,dog,cat,package").split(","),
@@ -633,6 +635,19 @@ async def run():
                             "→ %s on %s (%.0f%%, zones=%s)",
                             label, camera, score * 100, event.get("zones", []),
                         )
+
+                    # Pre-compress snapshot for faster NSE delivery. Reduces NSE
+                    # download from ~500ms (full-size from Frigate) to either 0ms
+                    # (embedded in APNs payload) or ~50ms (compressed, from CDN).
+                    # Failures are swallowed — the Worker/NSE will fall back to
+                    # fetching the original snapshot directly from Frigate.
+                    frigate_url = frigate_cfg.get("url")
+                    if frigate_url and event.get("id"):
+                        compressed = await fetch_and_compress_snapshot(
+                            frigate_url, event["id"], camera
+                        )
+                        if compressed:
+                            event["compressed_snapshot"] = compressed
 
                     send_start = time.time()
                     ok = await sender.send(event)

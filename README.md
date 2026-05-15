@@ -153,6 +153,7 @@ Set `mode: worker` (default) or `mode: direct` in `config.yaml`, or omit `PUSH_U
 | `MQTT_USER` | — | MQTT username (optional) |
 | `MQTT_PASSWORD` | — | MQTT password (optional) |
 | `MQTT_TOPIC` | `frigate/events` | Frigate event topic |
+| `FRIGATE_URL` | — | Frigate HTTP API URL (e.g., `http://192.168.1.50:5000`) for snapshot pre-compression. Optional — if omitted, snapshots are fetched by the NSE from Frigate directly. |
 | `PUSH_URL` | — | Your push URL from Lumen (enables worker mode) |
 | `FILTER_LABELS` | `person,car,dog,cat,package` | Comma-separated allowed labels |
 | `FILTER_MIN_SCORE` | `0.6` | Minimum detection confidence |
