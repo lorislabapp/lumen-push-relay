@@ -507,12 +507,13 @@ async def run():
         frigate_cfg["topic"],
     )
 
-    retry_delay = 1
+    retry_delay = 5  # Start with 5s (more aggressive than 1s, but not instant)
     while True:
         try:
             mqtt_kwargs = {
                 "hostname": frigate_cfg["mqtt_host"],
                 "port": frigate_cfg["mqtt_port"],
+                "keepalive": 15,  # Ping every 15s to detect disconnects quickly (was 60s default)
             }
             if frigate_cfg.get("mqtt_user"):
                 mqtt_kwargs["username"] = frigate_cfg["mqtt_user"]
@@ -550,7 +551,7 @@ async def run():
 
                 log.info("Connected to MQTT, listening for events...")
                 health_state.mark_mqtt_connected(frigate_cfg["mqtt_host"], frigate_cfg["mqtt_port"])
-                retry_delay = 1
+                retry_delay = 5  # Reset to initial delay on successful connect
 
                 async for message in mqtt.messages:
                     topic_str = str(message.topic)
@@ -653,7 +654,7 @@ async def run():
             log.error("Unexpected error: %s — reconnecting in %ds", e, retry_delay)
 
         await asyncio.sleep(retry_delay)
-        retry_delay = min(retry_delay * 2, 30)
+        retry_delay = min(retry_delay * 2, 40)  # Exponential backoff: 5→10→20→40s max
 
     # Cleanup is unreachable in practice (the loop above never exits) but
     # documents intent: when the process is killed, close the HTTP/2 client,
