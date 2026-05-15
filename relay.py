@@ -24,6 +24,7 @@ from src.auto_call.buttons import ButtonEngine, MatchEvaluator
 from src.auto_call.discovery import DiscoveryCache
 from src.auto_call.mqtt import SubscriptionManager, TopicRouter
 from src.auto_call.sync_endpoint import start_sync_server
+from src.health_monitor import health_state
 
 logging.basicConfig(
     level=logging.INFO,
@@ -548,6 +549,7 @@ async def run():
                     )
 
                 log.info("Connected to MQTT, listening for events...")
+                health_state.mark_mqtt_connected(frigate_cfg["mqtt_host"], frigate_cfg["mqtt_port"])
                 retry_delay = 1
 
                 async for message in mqtt.messages:
@@ -602,12 +604,17 @@ async def run():
                     label = event.get("label", "?")
                     score = event.get("top_score", 0)
 
+                    # Track all received events
+                    health_state.record_event_received(camera, label)
+
                     reason = should_notify(event, config)
                     if reason:
+                        health_state.record_event_filtered(reason)
                         log.debug("Suppressed %s on %s: %s", label, camera, reason)
                         continue
 
                     if not cooldown.check_and_claim(camera, label):
+                        health_state.record_event_filtered(f"cooldown active for {camera}/{label}")
                         log.debug("Cooldown active for %s/%s", camera, label)
                         continue
 
@@ -632,13 +639,17 @@ async def run():
                     event_age_s = (send_start - float(event["start_time"])) if event.get("start_time") else None
                     age_str = f"event_age={event_age_s:.1f}s " if event_age_s is not None else ""
                     if ok:
+                        health_state.record_event_delivered()
                         log.info("  ✓ Delivered %ssend=%dms", age_str, send_ms)
                     else:
+                        health_state.record_event_failed()
                         log.warning("  ✗ Failed %ssend=%dms", age_str, send_ms)
 
         except aiomqtt.MqttError as e:
+            health_state.mark_mqtt_disconnected()
             log.warning("MQTT disconnected: %s — reconnecting in %ds", e, retry_delay)
         except Exception as e:
+            health_state.mark_mqtt_disconnected()
             log.error("Unexpected error: %s — reconnecting in %ds", e, retry_delay)
 
         await asyncio.sleep(retry_delay)

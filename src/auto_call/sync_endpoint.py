@@ -4,7 +4,8 @@ Endpoints:
   POST /auto-call/sync       — full upsert of one device's configs + buttons
   POST /auto-call/test-push  — debug VoIP push for editor "Test" button
   GET  /auto-call/discover   — list HA-discovered button-shaped entities
-  GET  /auto-call/health     — health probe
+  GET  /auto-call/health     — health probe (auto-call subsystem only)
+  GET  /health               — relay-wide health (MQTT, events, uptime)
 """
 import asyncio
 import json
@@ -106,8 +107,15 @@ async def handle_sync(request: web.Request) -> web.Response:
     })
 
 
-async def handle_health(request: web.Request) -> web.Response:
+async def handle_autocall_health(request: web.Request) -> web.Response:
+    """Auto-call subsystem health only."""
     return web.json_response({"status": "ok", "service": "lumen-auto-call-sync"})
+
+
+async def handle_relay_health(request: web.Request) -> web.Response:
+    """Relay-wide health: MQTT status, event metrics, uptime."""
+    from ..health_monitor import health_state
+    return web.json_response(health_state.to_dict())
 
 
 async def handle_test_push(request: web.Request) -> web.Response:
@@ -174,7 +182,9 @@ def make_app(
     app.router.add_post("/auto-call/sync", handle_sync)
     app.router.add_post("/auto-call/test-push", handle_test_push)
     app.router.add_get("/auto-call/discover", handle_discover)
-    app.router.add_get("/auto-call/health", handle_health)
+    app.router.add_get("/auto-call/health", handle_autocall_health)
+    # Relay-wide health (MQTT + events + uptime)
+    app.router.add_get("/health", handle_relay_health)
     return app
 
 

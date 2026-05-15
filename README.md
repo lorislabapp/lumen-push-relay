@@ -197,6 +197,65 @@ The relay forwards events in <100 ms on a LAN. If you see delays, check APNs lat
 **Events logged but no push**  
 The worker mode returns 200 even if APNs drops the push. Check the worker logs (`wrangler tail` if self-hosting) or send a test push from Lumen's Settings → Push Notifications → Send Test.
 
+## Health Check Endpoint
+
+The relay exposes a **`/health` endpoint** on port **8765** (same port as the auto-call sync server). Use this to monitor relay status from the Lumen app or external monitoring tools.
+
+**Endpoint:** `GET http://<relay-host>:8765/health`
+
+**Response:**
+```json
+{
+  "status": "ok",
+  "uptime_seconds": 12345,
+  "mqtt": {
+    "connected": true,
+    "host": "192.168.1.50",
+    "port": 1883,
+    "connected_for_seconds": 12300,
+    "last_connected_at": "2026-05-15T10:30:00",
+    "last_disconnected_at": null
+  },
+  "events": {
+    "total_received": 456,
+    "filtered": 123,
+    "delivered": 330,
+    "failed": 3,
+    "last_event_ago_seconds": 5,
+    "last_event_camera": "front_door",
+    "last_event_label": "person",
+    "last_event_at": "2026-05-15T14:45:32"
+  }
+}
+```
+
+**Status codes:**
+- `"ok"` — MQTT connected, relay healthy
+- `"degraded"` — MQTT disconnected, relay attempting reconnect
+
+**Use cases:**
+- **Lumen app:** Pings `/health` every 60s when on local network, shows banner if relay is offline
+- **Monitoring:** Add to Uptime Kuma, Healthchecks.io, or Prometheus for alerting
+- **Debugging:** Check `last_event_ago_seconds` — if it's been hours, MQTT or filters may be misconfigured
+
+**Example — check from command line:**
+```bash
+curl http://192.168.1.100:8765/health | jq
+```
+
+**Example — Docker Compose with health check:**
+```yaml
+services:
+  lumen-push-relay:
+    image: lorislabapp/lumen-push-relay:latest
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8765/health"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+```
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
