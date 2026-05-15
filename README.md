@@ -49,6 +49,7 @@ docker run -d \
   --name lumen-push-relay \
   --restart unless-stopped \
   -e MQTT_HOST=192.168.1.50 \
+  -e FRIGATE_URL=http://192.168.1.50:5000 \
   -e PUSH_URL="paste-your-url-from-lumen-app" \
   lorislabapp/lumen-push-relay
 ```
@@ -67,6 +68,7 @@ services:
       MQTT_HOST: "192.168.1.50"
       MQTT_PORT: "1883"
       MQTT_TOPIC: "frigate/events"
+      FRIGATE_URL: "http://192.168.1.50:5000"
       PUSH_URL: "https://lumen-push.mail5491.workers.dev/v1/notify/YOUR_SECRET/YOUR_TOKEN"
       FILTER_LABELS: "person,car,package"
       FILTER_MIN_SCORE: "0.6"
