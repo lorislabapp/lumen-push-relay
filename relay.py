@@ -164,6 +164,78 @@ class DirectAPNsSender:
         await self._client.aclose()
 
 
+async def _fanout_ha_action(sender, action_payload: dict) -> None:
+    """Fan out a Home Assistant action payload to every registered Lumen
+    device as a silent APNs push.
+
+    The Lumen iOS app's AppDelegate intercepts background-only pushes
+    that carry a top-level `ha_action` field, extracts the JSON, and
+    routes it through HAActionListener.handle (which dispatches via an
+    allowlist of supported action types: open_camera, dismiss_all,
+    ping). Unknown action types are dropped on the client side, so
+    misuse of this MQTT topic can't trigger arbitrary behavior.
+
+    Silent pushes are subject to iOS rate limits (~2-3 per device per
+    hour for `content-available:1`). For higher-throughput HA flows,
+    Kevin will need to fall back to either CocoaMQTT in the iOS app
+    (no rate limit) or the URL scheme path (`lumen://action?...`) which
+    requires user tap. See Lumen iOS HAActionListener.swift for the
+    architecture trade-offs.
+
+    Errors are logged but never raised — a failed HA action push must
+    never destabilize the main event-push loop.
+    """
+    try:
+        if isinstance(sender, WorkerSender):
+            # Worker path: post the action to every Worker URL. The
+            # Worker is expected to recognize the `ha_action` shape
+            # and build a silent APNs payload itself (vs the regular
+            # event-driven path which posts {"type":"new","after":...}).
+            envelope = {"type": "ha_action", "ha_action": action_payload}
+            results = await asyncio.gather(
+                *(sender._send_one(url, envelope) for url in sender.push_urls),
+                return_exceptions=False,
+            )
+            delivered = sum(1 for ok in results if ok)
+            log.info("HA action fan-out: %d/%d delivered", delivered, len(sender.push_urls))
+        elif isinstance(sender, DirectAPNsSender):
+            # Direct APNs path: build a silent push payload and send to
+            # every registered device token. iOS will wake the app in
+            # the background; AppDelegate.didReceiveRemoteNotification
+            # dispatches to HAActionListener.handle(jsonData:).
+            payload = {
+                "aps": {
+                    "content-available": 1,
+                },
+                "ha_action": action_payload,
+            }
+            expires_at = int(time.time()) + 300  # 5 min — action is time-sensitive
+            headers_template = {
+                "apns-push-type": "background",
+                "apns-priority": "5",  # 5 = background, required when content-available
+                "apns-topic": sender.bundle_id,
+                "apns-expiration": str(expires_at),
+            }
+            tasks = []
+            for token in sender.device_tokens:
+                headers = dict(headers_template)
+                headers["authorization"] = f"bearer {sender._get_token()}"
+                tasks.append(
+                    sender._client.post(
+                        f"{sender.host}/3/device/{token}",
+                        json=payload,
+                        headers=headers,
+                    )
+                )
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            ok = sum(1 for r in results if not isinstance(r, Exception) and getattr(r, "status_code", 0) == 200)
+            log.info("HA action APNs fan-out: %d/%d delivered", ok, len(sender.device_tokens))
+        else:
+            log.warning("HA action: unknown sender type %s — dropping", type(sender).__name__)
+    except Exception as exc:
+        log.error("HA action fan-out failed: %s", exc)
+
+
 class CooldownTracker:
     """Per camera+label cooldown to avoid notification spam."""
 
@@ -527,6 +599,21 @@ async def run():
                 if discovery_cache is not None:
                     await mqtt.subscribe(f"{ha_discovery_prefix}/+/+/config")
 
+                # Phase 1 — HA → Lumen action endpoint. Subscribes to
+                # `lumen/action` (or whatever LUMEN_ACTION_TOPIC env var
+                # the operator configured) so a Home Assistant
+                # automation can `mqtt.publish` a JSON payload like
+                # `{"action":"open_camera","params":{"camera":"front"}}`
+                # and have it delivered as a silent APNs push to every
+                # registered Lumen device. iOS AppDelegate routes the
+                # `ha_action` key in the silent push to
+                # HAActionListener.handle which dispatches via the
+                # allowlisted action table (open_camera, dismiss_all,
+                # ping). See Lumen iOS HAActionListener.swift.
+                ha_action_topic = os.environ.get("LUMEN_ACTION_TOPIC", "lumen/action")
+                await mqtt.subscribe(ha_action_topic)
+                log.info("Subscribed to HA action topic: %s", ha_action_topic)
+
                 # Fresh per MQTT connection — the broker session is gone on reconnect,
                 # so subscription state must restart from empty.
                 subs_manager: SubscriptionManager | None = None
@@ -571,6 +658,30 @@ async def run():
                         if drained:
                             config_store.reload()
                             await subs_manager.reconcile(config_store.all_button_topics())
+
+                    # Phase 1 — HA action endpoint. Anything arriving on
+                    # `lumen/action` (or LUMEN_ACTION_TOPIC) is forwarded
+                    # to every registered device as a silent APNs push.
+                    # We MUST NOT fall through to the TopicRouter or the
+                    # Frigate event-handling path for these — they have
+                    # a totally different payload shape and would either
+                    # be silently dropped or trigger spurious error logs.
+                    if topic_str == ha_action_topic:
+                        try:
+                            action_payload = json.loads(payload_bytes)
+                        except (json.JSONDecodeError, TypeError) as exc:
+                            log.warning("HA action: bad JSON payload — %s", exc)
+                            continue
+                        if not isinstance(action_payload, dict) or "action" not in action_payload:
+                            log.warning("HA action: payload missing 'action' field")
+                            continue
+                        log.info("HA action received: %s", action_payload.get("action"))
+                        # Fire-and-forget — don't await so a slow APNs
+                        # round-trip doesn't back up the MQTT loop.
+                        asyncio.create_task(
+                            _fanout_ha_action(sender, action_payload)
+                        )
+                        continue
 
                     # Non-Frigate messages: route via TopicRouter (HA discovery + buttons).
                     if topic_str != frigate_cfg["topic"]:
