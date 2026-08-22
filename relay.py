@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Frigate Push Relay — sends push notifications for Frigate detection events.
+"""Frigate Push Relay — sends push notifications for Frigate review alerts.
 
 Supports two modes:
   - "worker" mode: POSTs events to a Cloudflare Worker URL (recommended for most users)
@@ -177,6 +177,88 @@ class CooldownTracker:
         return True
 
 
+class ReviewTracker:
+    """Deduplicate Review severity transitions with bounded memory."""
+
+    def __init__(self, max_entries: int = 4096):
+        self.max_entries = max_entries
+        self._seen: dict[str, None] = {}
+
+    def claim(self, review_id: str, severity: str) -> bool:
+        key = f"{review_id}/{severity}"
+        if key in self._seen:
+            return False
+        self._seen[key] = None
+        while len(self._seen) > self.max_entries:
+            self._seen.pop(next(iter(self._seen)))
+        return True
+
+
+def effective_mqtt_topic(config: dict) -> tuple[str, bool]:
+    """Return (topic, is_review_topic), auto-migrating legacy defaults.
+
+    Older compose snippets pinned ``frigate/events``. Keeping that value after
+    an image update would continue to notify for raw tracked objects that never
+    become a Frigate Review alert. Raw mode therefore requires an explicit
+    ``ALLOW_RAW_EVENTS=true`` opt-in.
+    """
+    frigate = config.get("frigate", {})
+    topic = str(frigate.get("topic") or "frigate/reviews").rstrip("/")
+    raw_opt_in = frigate.get("allow_raw_events", False)
+    allow_raw = raw_opt_in if isinstance(raw_opt_in, bool) else str(raw_opt_in).lower() in {
+        "1", "true", "yes"
+    }
+    if topic.endswith("/events") and not allow_raw:
+        topic = topic[: -len("/events")] + "/reviews"
+    return topic, topic.endswith("/reviews")
+
+
+def review_to_event(message: dict, allowed_severities: set[str]) -> tuple[dict | None, str | None]:
+    """Convert a ``frigate/reviews`` change into a linked push event."""
+    after = message.get("after")
+    if not isinstance(after, dict):
+        return None, "missing review after payload"
+
+    severity = str(after.get("severity") or "")
+    if severity not in allowed_severities:
+        return None, f"review severity '{severity}' not enabled"
+
+    before = message.get("before")
+    before_severity = before.get("severity") if isinstance(before, dict) else None
+    message_type = message.get("type")
+    if message_type not in {"new", "update"}:
+        return None, f"review message type '{message_type}' is not notifyable"
+    if message_type == "update" and before_severity == severity:
+        return None, f"review already at severity '{severity}'"
+
+    data = after.get("data")
+    if not isinstance(data, dict):
+        return None, "missing review data"
+    detections = data.get("detections") or []
+    if not isinstance(detections, list) or not detections:
+        return None, "review has no linked detection"
+    event_id = next((value for value in detections if isinstance(value, str) and value), None)
+    if not event_id:
+        return None, "review has no valid detection id"
+
+    objects = [value for value in (data.get("objects") or []) if isinstance(value, str) and value]
+    zones = [value for value in (data.get("zones") or []) if isinstance(value, str)]
+    start_time = after.get("start_time")
+    return {
+        "id": event_id,
+        "review_id": after.get("id"),
+        "review_severity": severity,
+        "camera": after.get("camera", "unknown"),
+        "label": objects[0] if objects else "activity",
+        "labels": objects,
+        "zones": zones,
+        "current_zones": zones,
+        "start_time": start_time,
+        "detected_at": start_time,
+        "source_schema": "frigate-review-v1",
+    }, None
+
+
 def build_apns_payload(event: dict) -> dict:
     """Build an APNs notification payload from a Frigate event (direct mode only)."""
     camera = event.get("camera", "unknown")
@@ -214,13 +296,16 @@ def build_apns_payload(event: dict) -> dict:
             "mutable-content": 1,
         },
         "eventId": event.get("id", ""),
+        "reviewId": event.get("review_id", ""),
+        "reviewSeverity": event.get("review_severity", ""),
+        "sourceSchema": event.get("source_schema", "legacy-event-v1"),
         "camera": camera,
         "label": label,
         "zones": zones,
         # Unix epoch seconds when Frigate first detected the event. The NSE uses
         # this to show "detected Xs ago" so the user can tell real-time pushes
         # apart from pushes that APNs held while the device was unreachable.
-        "detected_at": event.get("start_time"),
+        "detected_at": event.get("detected_at") or event.get("start_time"),
         "source": "mqtt-relay",
     }
 
@@ -252,13 +337,18 @@ def should_notify(event: dict, config: dict) -> str | None:
             return f"stale event (age={age:.0f}s > {max_age}s)"
 
     label = event.get("label", "")
+    event_labels = event.get("labels") or [label]
     allowed_labels = filters.get("labels", [])
-    if allowed_labels and label not in allowed_labels:
-        return f"label '{label}' not in allowed list"
+    if allowed_labels:
+        matching_labels = [value for value in event_labels if value in allowed_labels]
+        if not matching_labels:
+            return f"labels {event_labels!r} not in allowed list"
+        label = matching_labels[0]
+        event["label"] = label
 
-    score = event.get("top_score", 0)
+    score = event.get("top_score")
     min_score = filters.get("min_score", 0)
-    if score < min_score:
+    if score is not None and score < min_score:
         return f"score {score:.2f} < {min_score}"
 
     if event.get("stationary"):
@@ -274,10 +364,14 @@ def should_notify(event: dict, config: dict) -> str | None:
         if not cam_cfg.get("enabled", True):
             return f"camera '{camera}' disabled"
         cam_labels = cam_cfg.get("labels")
-        if cam_labels and label not in cam_labels:
-            return f"label '{label}' not allowed on camera '{camera}'"
+        if cam_labels:
+            matching_labels = [value for value in event_labels if value in cam_labels]
+            if not matching_labels:
+                return f"labels {event_labels!r} not allowed on camera '{camera}'"
+            label = matching_labels[0]
+            event["label"] = label
         cam_min = cam_cfg.get("min_score")
-        if cam_min and score < cam_min:
+        if cam_min and score is not None and score < cam_min:
             return f"score {score:.2f} < {cam_min} for camera '{camera}'"
         required_zones = cam_cfg.get("required_zones")
         if required_zones and not set(zones) & set(required_zones):
@@ -343,13 +437,20 @@ def load_config() -> dict:
             "mqtt_port": int(os.environ.get("MQTT_PORT", "1883")),
             "mqtt_user": os.environ.get("MQTT_USER"),
             "mqtt_password": os.environ.get("MQTT_PASSWORD"),
-            "topic": os.environ.get("MQTT_TOPIC", "frigate/events"),
+            "topic": os.environ.get("MQTT_TOPIC", "frigate/reviews"),
+            "allow_raw_events": os.environ.get("ALLOW_RAW_EVENTS", "").lower()
+            in {"1", "true", "yes"},
         },
         "filters": {
             "labels": os.environ.get("FILTER_LABELS", "person,car,dog,cat,package").split(","),
             "min_score": float(os.environ.get("FILTER_MIN_SCORE", "0.6")),
             "cooldown_seconds": int(os.environ.get("COOLDOWN_SECONDS", "120")),
             "max_event_age_seconds": int(os.environ.get("FILTER_MAX_EVENT_AGE", "120")),
+            "review_severities": [
+                value.strip()
+                for value in os.environ.get("REVIEW_SEVERITIES", "alert").split(",")
+                if value.strip()
+            ],
         },
     }
 
@@ -384,6 +485,7 @@ async def run():
     config = load_config()
 
     frigate_cfg = config["frigate"]
+    mqtt_topic, is_review_topic = effective_mqtt_topic(config)
     cooldown_sec = config.get("filters", {}).get("cooldown_seconds", 120)
 
     # Determine mode. Config files may specify either `worker.push_urls`
@@ -423,12 +525,19 @@ async def run():
         log.info("Mode: DIRECT APNs → %s (%d devices)", apns_cfg.get("environment", "production"), len(devices))
 
     cooldown = CooldownTracker(cooldown_sec)
+    review_tracker = ReviewTracker()
+    configured_severities = config.get("filters", {}).get("review_severities", ["alert"])
+    if isinstance(configured_severities, str):
+        configured_severities = configured_severities.split(",")
+    allowed_review_severities = {
+        str(value).strip() for value in configured_severities if str(value).strip()
+    } or {"alert"}
 
     log.info(
         "Connecting to MQTT %s:%d topic=%s",
         frigate_cfg["mqtt_host"],
         frigate_cfg["mqtt_port"],
-        frigate_cfg["topic"],
+        mqtt_topic,
     )
 
     retry_delay = 1
@@ -444,8 +553,11 @@ async def run():
                 mqtt_kwargs["password"] = frigate_cfg["mqtt_password"]
 
             async with aiomqtt.Client(**mqtt_kwargs) as mqtt:
-                await mqtt.subscribe(frigate_cfg["topic"])
-                log.info("Connected to MQTT, listening for events...")
+                await mqtt.subscribe(mqtt_topic)
+                log.info(
+                    "Connected to MQTT, listening for %s...",
+                    "Review alerts" if is_review_topic else "raw tracked objects",
+                )
                 retry_delay = 1
 
                 async for message in mqtt.messages:
@@ -454,21 +566,35 @@ async def run():
                     except (json.JSONDecodeError, TypeError):
                         continue
 
-                    if data.get("type") != "new":
-                        continue
-
-                    event = data.get("after") or data.get("before")
-                    if not event:
-                        continue
+                    if is_review_topic:
+                        event, review_reason = review_to_event(data, allowed_review_severities)
+                        if not event:
+                            log.debug("Suppressed review: %s", review_reason)
+                            continue
+                        review_id = event.get("review_id")
+                        severity = event.get("review_severity", "")
+                        if not review_id or not review_tracker.claim(str(review_id), str(severity)):
+                            log.debug("Duplicate review transition %s/%s", review_id, severity)
+                            continue
+                    else:
+                        if data.get("type") != "new":
+                            continue
+                        event = data.get("after") or data.get("before")
+                        if not event:
+                            continue
 
                     camera = event.get("camera", "?")
                     label = event.get("label", "?")
-                    score = event.get("top_score", 0)
+                    score = event.get("top_score")
 
                     reason = should_notify(event, config)
                     if reason:
                         log.debug("Suppressed %s on %s: %s", label, camera, reason)
                         continue
+
+                    # should_notify selects the first globally/per-camera allowed
+                    # object when a Review contains multiple object labels.
+                    label = event.get("label", label)
 
                     if not cooldown.check_and_claim(camera, label):
                         log.debug("Cooldown active for %s/%s", camera, label)
@@ -480,13 +606,13 @@ async def run():
                         event = {**event, **zone_msg}
                         log.info(
                             "→ %s on %s (%.0f%%, zones=%s) [%s]",
-                            label, camera, score * 100, event.get("zones", []),
+                            label, camera, (score or 0) * 100, event.get("zones", []),
                             zone_msg.get("custom_title", ""),
                         )
                     else:
                         log.info(
                             "→ %s on %s (%.0f%%, zones=%s)",
-                            label, camera, score * 100, event.get("zones", []),
+                            label, camera, (score or 0) * 100, event.get("zones", []),
                         )
 
                     send_start = time.time()

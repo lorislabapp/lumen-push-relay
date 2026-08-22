@@ -1,6 +1,6 @@
 # lumen-push-relay
 
-MQTT-to-push bridge for [Lumen for Frigate](https://apps.apple.com/app/id6760238729). Subscribes to your Frigate MQTT broker, filters detection events, and forwards them through Lumen's Cloudflare relay to Apple Push Notifications (APNs) in under a second.
+MQTT-to-push bridge for [Lumen for Frigate](https://apps.apple.com/app/id6760238729). Subscribes to Frigate's Review alerts and forwards them through Lumen's Cloudflare relay to Apple Push Notifications (APNs) in under a second.
 
 **Fast (<1s), private (no images leave your network), open source.**
 
@@ -8,8 +8,8 @@ MQTT-to-push bridge for [Lumen for Frigate](https://apps.apple.com/app/id6760238
 
 Frigate publishes detection events over MQTT but does not send HTTP webhooks or push notifications natively. `lumen-push-relay` is the missing bridge — a small Python process that:
 
-1. Subscribes to `frigate/events` on your MQTT broker
-2. Filters on label, confidence, camera, zone, schedule, cooldown
+1. Subscribes to `frigate/reviews` on your MQTT broker
+2. Filters Review alerts on label, camera, zone, schedule, cooldown
 3. Forwards a small JSON payload to Lumen's Cloudflare Worker
 4. Worker signs APNs JWTs and delivers the push to your iPhone, iPad, Mac, Watch, or Vision Pro
 
@@ -66,7 +66,7 @@ services:
     environment:
       MQTT_HOST: "192.168.1.50"
       MQTT_PORT: "1883"
-      MQTT_TOPIC: "frigate/events"
+      MQTT_TOPIC: "frigate/reviews"
       PUSH_URL: "https://lumen-push.mail5491.workers.dev/v1/notify/YOUR_SECRET/YOUR_TOKEN"
       FILTER_LABELS: "person,car,package"
       FILTER_MIN_SCORE: "0.6"
@@ -152,7 +152,9 @@ Set `mode: worker` (default) or `mode: direct` in `config.yaml`, or omit `PUSH_U
 | `MQTT_PORT` | `1883` | MQTT broker port |
 | `MQTT_USER` | — | MQTT username (optional) |
 | `MQTT_PASSWORD` | — | MQTT password (optional) |
-| `MQTT_TOPIC` | `frigate/events` | Frigate event topic |
+| `MQTT_TOPIC` | `frigate/reviews` | Frigate Review topic |
+| `REVIEW_SEVERITIES` | `alert` | Review severities to notify (`alert,detection` to include both) |
+| `ALLOW_RAW_EVENTS` | `false` | Explicit compatibility opt-in for `*/events`; may notify objects absent from Review |
 | `PUSH_URL` | — | Your push URL from Lumen (enables worker mode) |
 | `FILTER_LABELS` | `person,car,dog,cat,package` | Comma-separated allowed labels |
 | `FILTER_MIN_SCORE` | `0.6` | Minimum detection confidence |

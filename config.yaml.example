@@ -9,7 +9,7 @@ frigate:
   mqtt_port: 1883
   # mqtt_user: your_user       # optional
   # mqtt_password: your_pass   # optional
-  topic: frigate/events        # Frigate's default event topic
+  topic: frigate/reviews       # Frigate's user-visible Review change feed
 
 mode: worker                   # "worker" (recommended) or "direct"
 
@@ -30,6 +30,7 @@ worker:
 #   - token: "your_64_char_hex_device_token_here"
 
 filters:
+  review_severities: [alert]    # add detection only if lower-priority Review items should notify
   labels:                      # only notify for these labels
     - person
     - car
