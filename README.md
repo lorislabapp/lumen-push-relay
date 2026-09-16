@@ -67,7 +67,7 @@ services:
       MQTT_HOST: "192.168.1.50"
       MQTT_PORT: "1883"
       MQTT_TOPIC: "frigate/reviews"
-      PUSH_URL: "https://lumen-push.mail5491.workers.dev/v1/notify/YOUR_SECRET/YOUR_TOKEN"
+      PUSH_URL: "https://lumen-push.mail5491.workers.dev/v2/notify/YOUR_CHANNEL_ID"  # copy from Lumen → Instant Push
       FILTER_LABELS: "person,car,package"
       FILTER_MIN_SCORE: "0.6"
       COOLDOWN_SECONDS: "120"
@@ -78,11 +78,16 @@ services:
 
 ## Multi-device fan-out (iPhone + Apple Watch, iPad, Mac, Vision Pro)
 
-Each Lumen install gives you its own **Copy URL** button — one per device. The relay fans every Frigate event out to every URL you give it, so you get a push on every device simultaneously. Filters and cooldown run **once** before fan-out, so you still get at most one push per event regardless of how many devices are configured.
+Lumen 1.17 and later give you **one Push URL for all your devices**:
+`https://lumen-push.mail5491.workers.dev/v2/notify/<channel ID>`. Every device signed in to the same iCloud account registers on that channel, and the Worker delivers each Frigate event to all of them. Paste that single URL into `PUSH_URL` — no per-device URLs needed.
 
-**The standalone Apple Watch app** (watchOS 11+) uses this to receive Frigate push directly over cellular, even with the paired iPhone out of range or powered off.
+If you regenerate the URL in Lumen, update `PUSH_URL` too. Use **Send Test Notification** in Lumen to check the channel: it reports whether the push server has a device on it.
 
-Add additional URLs with `PUSH_URL_2`, `PUSH_URL_3`, … (up to 32), or pass a comma-separated list via `PUSH_URLS`:
+**The standalone Apple Watch app** (watchOS 11+) registers on the same channel, so it receives Frigate push directly over cellular, even with the paired iPhone out of range or powered off.
+
+### Older app versions (v1 URLs)
+
+Before 1.17, each device gave its own URL of the form `…/v1/notify/<secret>/<device token>`. Those URLs still work. To send to several of them, add `PUSH_URL_2`, `PUSH_URL_3`, … (up to 32), or pass a comma-separated list via `PUSH_URLS`:
 
 ```yaml
 services:
@@ -90,9 +95,8 @@ services:
     image: lorislabapp/lumen-push-relay:latest
     environment:
       MQTT_HOST: "192.168.1.50"
-      PUSH_URL:   "https://lumen-push.mail5491.workers.dev/v1/notify/SECRET_A/TOKEN_IPHONE"
-      PUSH_URL_2: "https://lumen-push.mail5491.workers.dev/v1/notify/SECRET_B/TOKEN_WATCH"
-      # PUSH_URL_3: "…/TOKEN_MAC"
+      PUSH_URL:   "URL copied from the iPhone"
+      PUSH_URL_2: "URL copied from the Apple Watch"
 ```
 
 Or a single variable:
@@ -101,7 +105,7 @@ Or a single variable:
       PUSH_URLS: "URL_IPHONE,URL_WATCH,URL_MAC"
 ```
 
-`PUSH_URLS` takes precedence if both forms are set.
+`PUSH_URLS` takes precedence if both forms are set. Filters and cooldown run **once** before fan-out, so you still get at most one push per event.
 
 ## Per-camera rules (advanced)
 
