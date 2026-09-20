@@ -1,6 +1,6 @@
 services:
   lumen-push-relay:
-    image: lorislabapp/lumen-push-relay:latest
+    image: lorislabapp/lumen-push-relay:review-confidence-20260920
     # Or build locally:
     # build: .
     container_name: lumen-push-relay
@@ -22,7 +22,12 @@ services:
       FILTER_MIN_SCORE: "0.6"
       COOLDOWN_SECONDS: "120"
       REVIEW_SEVERITIES: "alert"
+      LUMEN_REVIEW_STATE_PATH: "/state/review-delivery-state.json"
 
-    # Optional: mount a config file for advanced per-camera rules
-    # volumes:
-    #   - ./config.yaml:/config/config.yaml
+    volumes:
+      - review-state:/state
+      # Optional configuration takes precedence over environment filters:
+      # - ./config.yaml:/config/config.yaml:ro
+
+volumes:
+  review-state:
