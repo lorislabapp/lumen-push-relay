@@ -197,3 +197,12 @@ MIT — see [LICENSE](LICENSE).
 - [lumen-push](https://github.com/lorislabapp/lumen-push) — the Cloudflare Worker that receives events and signs APNs JWTs
 - [Frigate NVR](https://github.com/blakeblackshear/frigate) — open-source AI-powered NVR
 - [LorisLabs](https://lorislab.fr) — developer website
+
+
+## Review confidence update (2026-09-20)
+
+The `review-confidence-20260920` image correlates Frigate Reviews with their MQTT object evidence before applying label, confidence, zone and stationary filters. Both the `frigate/reviews` and `frigate/events` topics must be accessible; a raw event alone never sends a notification. Legacy `MQTT_TOPIC=frigate/events` is automatically migrated to the matching Review topic. `ALLOW_RAW_EVENTS` no longer enables standalone raw pushes.
+
+For person/car notifications at Frigate `top_score >= 0.75`, set `FILTER_LABELS=person,car`, `FILTER_MIN_SCORE=0.75`, `REVIEW_SEVERITIES=alert`. `FILTER_REVIEW_SEVERITIES` is also accepted and takes precedence. This does not reduce Frigate recording; Frigate's Review alert policy must include the desired labels. Stationary objects are suppressed. Keep broader Review detections by explicitly choosing `alert,detection` if desired.
+
+If `/config/config.yaml` exists, edit its `filters.labels`, `filters.min_score`, and `filters.review_severities` instead: YAML takes precedence over environment settings. Preserve all MQTT credentials and existing push URLs. See `MIGRATION_REVIEW_CONFIDENCE.md` before changing a running installation.

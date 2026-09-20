@@ -9,6 +9,8 @@ Supports two modes:
 import asyncio
 import json
 import logging
+import math
+import hashlib
 import os
 import time
 from datetime import datetime
@@ -17,6 +19,7 @@ from pathlib import Path
 import aiomqtt
 import httpx
 import yaml
+from src.review_contract import ReviewCorrelator
 
 logging.basicConfig(
     level=logging.INFO,
@@ -64,22 +67,19 @@ class WorkerSender:
             return False
 
     async def send(self, event: dict) -> bool:
-        """POST a Frigate event payload to every configured Worker URL.
+        """POST one canonical Review envelope to every configured Worker URL.
 
-        Returns True if at least one URL accepted the payload — that
-        matches the prior single-URL semantics so the main loop's
-        ok/fail logging stays meaningful.
+        Returns True only when every destination accepted the envelope.
+        Failed destinations must remain retryable.
         """
-        # The Worker expects the same format as Frigate MQTT: {"type":"new","after":{...}}
-        payload = {"type": "new", "before": None, "after": event}
         results = await asyncio.gather(
-            *(self._send_one(url, payload) for url in self.push_urls),
+            *(self._send_one(url, event) for url in self.push_urls),
             return_exceptions=False,
         )
         delivered = sum(1 for ok in results if ok)
         if delivered < len(self.push_urls):
             log.warning("Fan-out partial: %d/%d URLs delivered", delivered, len(self.push_urls))
-        return delivered > 0
+        return delivered == len(self.push_urls)
 
     async def close(self):
         await self._client.aclose()
@@ -113,6 +113,7 @@ class DirectAPNsSender:
         self.device_tokens = device_tokens
         self._token: str | None = None
         self._token_time: float = 0
+        self._accepted: dict[str, None] = {}
         self._client = httpx.AsyncClient(http2=True, timeout=10)
 
     def _get_token(self) -> str:
@@ -139,20 +140,28 @@ class DirectAPNsSender:
             "authorization": f"bearer {self._get_token()}",
             "apns-topic": self.bundle_id,
             "apns-push-type": "alert",
-            "apns-priority": "10",
+            "apns-priority": "5" if event.get("isEnrichment") else "10",
+            "apns-collapse-id": hashlib.sha256(json.dumps([event["reviewId"], event["reviewSeverity"]]).encode()).hexdigest(),
             "apns-expiration": str(expires_at),
         }
-        success = False
+        success = True
         for token in self.device_tokens:
+            receipt = json.dumps([token, event["reviewId"], event["reviewSeverity"], bool(event.get("isEnrichment"))])
+            if receipt in self._accepted:
+                continue
             url = f"{self.host}/3/device/{token}"
             try:
                 resp = await self._client.post(url, json=payload, headers=headers)
                 if resp.status_code == 200:
-                    log.info("Push delivered to %s...%s", token[:8], token[-8:])
-                    success = True
+                    self._accepted[receipt] = None
+                    while len(self._accepted) > 4096:
+                        self._accepted.pop(next(iter(self._accepted)))
+                    log.info("Push accepted by APNs")
                 else:
+                    success = False
                     log.error("APNs error %d for %s...%s: %s", resp.status_code, token[:8], token[-8:], resp.text)
             except Exception as e:
+                success = False
                 log.error("APNs request failed for %s...%s: %s", token[:8], token[-8:], e)
         return success
 
@@ -167,6 +176,10 @@ class CooldownTracker:
         self.cooldown = cooldown_seconds
         self._last: dict[str, float] = {}
 
+    def release(self, camera: str, label: str) -> None:
+        """A failed transport must not consume the next retry's cooldown."""
+        self._last.pop(f"{camera}/{label}", None)
+
     def check_and_claim(self, camera: str, label: str) -> bool:
         key = f"{camera}/{label}"
         now = time.time()
@@ -177,93 +190,25 @@ class CooldownTracker:
         return True
 
 
-class ReviewTracker:
-    """Deduplicate Review severity transitions with bounded memory."""
-
-    def __init__(self, max_entries: int = 4096):
-        self.max_entries = max_entries
-        self._seen: dict[str, None] = {}
-
-    def claim(self, review_id: str, severity: str) -> bool:
-        key = f"{review_id}/{severity}"
-        if key in self._seen:
-            return False
-        self._seen[key] = None
-        while len(self._seen) > self.max_entries:
-            self._seen.pop(next(iter(self._seen)))
-        return True
 
 
 def effective_mqtt_topic(config: dict) -> tuple[str, bool]:
-    """Return (topic, is_review_topic), auto-migrating legacy defaults.
-
-    Older compose snippets pinned ``frigate/events``. Keeping that value after
-    an image update would continue to notify for raw tracked objects that never
-    become a Frigate Review alert. Raw mode therefore requires an explicit
-    ``ALLOW_RAW_EVENTS=true`` opt-in.
-    """
-    frigate = config.get("frigate", {})
-    topic = str(frigate.get("topic") or "frigate/reviews").rstrip("/")
-    raw_opt_in = frigate.get("allow_raw_events", False)
-    allow_raw = raw_opt_in if isinstance(raw_opt_in, bool) else str(raw_opt_in).lower() in {
-        "1", "true", "yes"
-    }
-    if topic.endswith("/events") and not allow_raw:
-        topic = topic[: -len("/events")] + "/reviews"
-    return topic, topic.endswith("/reviews")
+    """Keep legacy/custom prefixes, but never grant raw objects push authority."""
+    topic = str(config.get("frigate", {}).get("topic") or "frigate/reviews").rstrip("/")
+    if topic.endswith("/events"):
+        topic = topic[:-len("/events")] + "/reviews"
+    if not topic.endswith("/reviews"):
+        raise ValueError("MQTT_TOPIC must end in /reviews or /events")
+    return topic, True
 
 
-def review_to_event(message: dict, allowed_severities: set[str]) -> tuple[dict | None, str | None]:
-    """Convert a ``frigate/reviews`` change into a linked push event."""
-    after = message.get("after")
-    if not isinstance(after, dict):
-        return None, "missing review after payload"
-
-    severity = str(after.get("severity") or "")
-    if severity not in allowed_severities:
-        return None, f"review severity '{severity}' not enabled"
-
-    before = message.get("before")
-    before_severity = before.get("severity") if isinstance(before, dict) else None
-    message_type = message.get("type")
-    if message_type not in {"new", "update"}:
-        return None, f"review message type '{message_type}' is not notifyable"
-    if message_type == "update" and before_severity == severity:
-        return None, f"review already at severity '{severity}'"
-
-    data = after.get("data")
-    if not isinstance(data, dict):
-        return None, "missing review data"
-    detections = data.get("detections") or []
-    if not isinstance(detections, list) or not detections:
-        return None, "review has no linked detection"
-    event_id = next((value for value in detections if isinstance(value, str) and value), None)
-    if not event_id:
-        return None, "review has no valid detection id"
-
-    objects = [value for value in (data.get("objects") or []) if isinstance(value, str) and value]
-    zones = [value for value in (data.get("zones") or []) if isinstance(value, str)]
-    start_time = after.get("start_time")
-    return {
-        "id": event_id,
-        "review_id": after.get("id"),
-        "review_severity": severity,
-        "camera": after.get("camera", "unknown"),
-        "label": objects[0] if objects else "activity",
-        "labels": objects,
-        "zones": zones,
-        "current_zones": zones,
-        "start_time": start_time,
-        "detected_at": start_time,
-        "source_schema": "frigate-review-v1",
-    }, None
 
 
 def build_apns_payload(event: dict) -> dict:
-    """Build an APNs notification payload from a Frigate event (direct mode only)."""
+    """Build APNs content from an already-correlated Review envelope."""
     camera = event.get("camera", "unknown")
     label = event.get("label", "unknown")
-    score = event.get("top_score", 0)
+    score = event.get("score", 0)
     zones = event.get("zones", [])
     sub_label = event.get("sub_label")
 
@@ -282,32 +227,38 @@ def build_apns_payload(event: dict) -> dict:
     title = event.get("custom_title") or f"{label.title()} Detected"
     body = event.get("custom_body") or body
 
-    return {
+    payload = {
         "aps": {
             "alert": {
                 "title": title,
                 "subtitle": camera_display,
                 "body": body,
             },
-            "sound": "default",
-            "interruption-level": "time-sensitive",
+            "sound": None if event.get("isEnrichment") else "default",
+            "interruption-level": "passive" if event.get("isEnrichment") else "time-sensitive",
             "category": "FRIGATE_EVENT",
             "thread-id": camera,
             "mutable-content": 1,
         },
-        "eventId": event.get("id", ""),
-        "reviewId": event.get("review_id", ""),
-        "reviewSeverity": event.get("review_severity", ""),
-        "sourceSchema": event.get("source_schema", "legacy-event-v1"),
+        "eventId": event.get("eventId", ""),
+        "sourceSchema": event.get("sourceSchema"),
+        "reviewId": event.get("reviewId"),
+        "reviewSeverity": event.get("reviewSeverity"),
         "camera": camera,
         "label": label,
         "zones": zones,
+        "top_score": score,
+        "stationary": event.get("stationary"),
+        "isEnrichment": event.get("isEnrichment", False),
         # Unix epoch seconds when Frigate first detected the event. The NSE uses
         # this to show "detected Xs ago" so the user can tell real-time pushes
         # apart from pushes that APNs held while the device was unreachable.
-        "detected_at": event.get("detected_at") or event.get("start_time"),
-        "source": "mqtt-relay",
+        "detected_at": event.get("detected_at"),
+        "source": event.get("source", "mqtt-relay"),
     }
+    if event.get("isEnrichment"):
+        payload["aps"].pop("sound", None)
+    return payload
 
 
 def _in_schedule(schedule: str) -> bool:
@@ -337,18 +288,17 @@ def should_notify(event: dict, config: dict) -> str | None:
             return f"stale event (age={age:.0f}s > {max_age}s)"
 
     label = event.get("label", "")
-    event_labels = event.get("labels") or [label]
     allowed_labels = filters.get("labels", [])
-    if allowed_labels:
-        matching_labels = [value for value in event_labels if value in allowed_labels]
-        if not matching_labels:
-            return f"labels {event_labels!r} not in allowed list"
-        label = matching_labels[0]
-        event["label"] = label
+    if allowed_labels and label not in allowed_labels:
+        return f"label '{label}' not in allowed list"
 
-    score = event.get("top_score")
+    score = event.get("top_score", 0)
     min_score = filters.get("min_score", 0)
-    if score is not None and score < min_score:
+    if type(min_score) not in (int, float) or not math.isfinite(min_score) or not 0 <= min_score <= 1:
+        return "invalid confidence filter configuration"
+    if type(score) not in (int, float) or not math.isfinite(score) or not 0 <= score <= 1:
+        return "missing or invalid Frigate confidence"
+    if score < min_score:
         return f"score {score:.2f} < {min_score}"
 
     if event.get("stationary"):
@@ -364,14 +314,10 @@ def should_notify(event: dict, config: dict) -> str | None:
         if not cam_cfg.get("enabled", True):
             return f"camera '{camera}' disabled"
         cam_labels = cam_cfg.get("labels")
-        if cam_labels:
-            matching_labels = [value for value in event_labels if value in cam_labels]
-            if not matching_labels:
-                return f"labels {event_labels!r} not allowed on camera '{camera}'"
-            label = matching_labels[0]
-            event["label"] = label
+        if cam_labels and label not in cam_labels:
+            return f"label '{label}' not allowed on camera '{camera}'"
         cam_min = cam_cfg.get("min_score")
-        if cam_min and score is not None and score < cam_min:
+        if cam_min and score < cam_min:
             return f"score {score:.2f} < {cam_min} for camera '{camera}'"
         required_zones = cam_cfg.get("required_zones")
         if required_zones and not set(zones) & set(required_zones):
@@ -395,6 +341,22 @@ def get_zone_message(event: dict, config: dict) -> dict | None:
     return None
 
 
+def _clean_env_url(raw: str) -> str:
+    """Normalise a URL pulled from an env var.
+
+    Docker Compose's list-form `environment:` keeps surrounding quotes as
+    part of the value (e.g. `- PUSH_URL="https://x/y "` yields the literal
+    string `"https://x/y "`, quotes and trailing space included). urllib
+    then rejects it with "Request URL is missing an 'http://' or 'https://'
+    protocol." Strip whitespace, then any matching surrounding quotes, then
+    whitespace again so quoted/padded values still work.
+    """
+    s = raw.strip()
+    while len(s) >= 2 and s[0] == s[-1] and s[0] in ("'", '"'):
+        s = s[1:-1].strip()
+    return s
+
+
 def _collect_push_urls_from_env() -> list[str]:
     """Return the list of worker URLs configured via env vars.
 
@@ -402,17 +364,17 @@ def _collect_push_urls_from_env() -> list[str]:
     PUSH_URL_2..PUSH_URL_N are concatenated in numeric order. Preserves
     order and drops duplicates / empties so the fan-out is predictable.
     """
-    raw_csv = os.environ.get("PUSH_URLS", "").strip()
+    raw_csv = _clean_env_url(os.environ.get("PUSH_URLS", ""))
     if raw_csv:
-        candidates = [u.strip() for u in raw_csv.split(",")]
+        candidates = [_clean_env_url(u) for u in raw_csv.split(",")]
     else:
         candidates = []
         if base := os.environ.get("PUSH_URL"):
-            candidates.append(base.strip())
+            candidates.append(_clean_env_url(base))
         # PUSH_URL_2, PUSH_URL_3, ... — accept a reasonable ceiling
         for n in range(2, 33):
             if extra := os.environ.get(f"PUSH_URL_{n}"):
-                candidates.append(extra.strip())
+                candidates.append(_clean_env_url(extra))
 
     seen = set()
     ordered: list[str] = []
@@ -448,7 +410,7 @@ def load_config() -> dict:
             "max_event_age_seconds": int(os.environ.get("FILTER_MAX_EVENT_AGE", "120")),
             "review_severities": [
                 value.strip()
-                for value in os.environ.get("REVIEW_SEVERITIES", "alert").split(",")
+                for value in os.environ.get("FILTER_REVIEW_SEVERITIES", os.environ.get("REVIEW_SEVERITIES", "alert")).split(",")
                 if value.strip()
             ],
         },
@@ -478,6 +440,64 @@ def load_config() -> dict:
         config["devices"] = [{"token": t.strip()} for t in tokens.split(",") if t.strip()]
 
     return config
+
+
+class NotificationPipeline:
+    """Correlate Review authority with real object confidence before any send."""
+
+    def __init__(self, config: dict, sender):
+        self.config = config
+        self.sender = sender
+        review_topic, _ = effective_mqtt_topic(config)
+        prefix = review_topic[:-len("/reviews")]
+        self.topics = (review_topic, prefix + "/events", prefix + "/tracked_object_update")
+        filters = config.get("filters", {})
+        severities = filters.get("review_severities", ["alert"])
+        if isinstance(severities, str):
+            severities = [v.strip() for v in severities.split(",") if v.strip()]
+        self.cooldown = CooldownTracker(filters.get("cooldown_seconds", 120))
+        self.correlator = ReviewCorrelator(
+            state_path=os.environ.get("LUMEN_REVIEW_STATE_PATH", "/config/review-delivery-state.json"),
+            allowed_severities=frozenset(severities),
+            event_filter=lambda event: should_notify(event, config) is None,
+        )
+
+    async def handle(self, topic: str, message: dict):
+        if topic == self.topics[0]:
+            envelopes = self.correlator.ingest_review_message(message)
+        elif topic == self.topics[1]:
+            envelopes = self.correlator.ingest_event_message(message)
+        elif topic == self.topics[2]:
+            envelopes = self.correlator.ingest_identity_update(message)
+        else:
+            return
+        for envelope in envelopes:
+            await self.deliver(envelope)
+
+    async def deliver(self, envelope: dict):
+        event = {"id": envelope["eventId"], "camera": envelope["camera"],
+                 "label": envelope["label"], "top_score": envelope["score"],
+                 "start_time": envelope["detected_at"], "zones": envelope.get("zones", []),
+                 "stationary": envelope.get("stationary", False)}
+        reason = should_notify(event, self.config)
+        camera, label = event["camera"], event["label"]
+        enrichment = bool(envelope.get("isEnrichment"))
+        if reason or (not enrichment and not self.cooldown.check_and_claim(camera, label)):
+            self.correlator.complete_delivery(envelope, terminal=True, notified=False)
+            return
+        zone_message = get_zone_message(event, self.config)
+        if zone_message:
+            envelope = {**envelope, **zone_message}
+        try:
+            accepted = await self.sender.send(envelope)
+        except Exception as error:
+            log.warning("Review transport failed (%s)", type(error).__name__)
+            accepted = False
+        self.correlator.complete_delivery(envelope, terminal=accepted)
+        if not accepted and not enrichment:
+            self.cooldown.release(camera, label)
+        log.info("Review %s: %s (%.0f%%)", envelope["reviewId"],
+                 "accepted" if accepted else "transport failed; retry available", envelope["score"] * 100)
 
 
 async def run():
@@ -524,14 +544,8 @@ async def run():
         )
         log.info("Mode: DIRECT APNs → %s (%d devices)", apns_cfg.get("environment", "production"), len(devices))
 
-    cooldown = CooldownTracker(cooldown_sec)
-    review_tracker = ReviewTracker()
-    configured_severities = config.get("filters", {}).get("review_severities", ["alert"])
-    if isinstance(configured_severities, str):
-        configured_severities = configured_severities.split(",")
-    allowed_review_severities = {
-        str(value).strip() for value in configured_severities if str(value).strip()
-    } or {"alert"}
+    pipeline = NotificationPipeline(config, sender)
+    review_topic, event_topic, identity_topic = pipeline.topics
 
     log.info(
         "Connecting to MQTT %s:%d topic=%s",
@@ -553,7 +567,8 @@ async def run():
                 mqtt_kwargs["password"] = frigate_cfg["mqtt_password"]
 
             async with aiomqtt.Client(**mqtt_kwargs) as mqtt:
-                await mqtt.subscribe(mqtt_topic)
+                for topic in pipeline.topics:
+                    await mqtt.subscribe(topic)
                 log.info(
                     "Connected to MQTT, listening for %s...",
                     "Review alerts" if is_review_topic else "raw tracked objects",
@@ -566,64 +581,7 @@ async def run():
                     except (json.JSONDecodeError, TypeError):
                         continue
 
-                    if is_review_topic:
-                        event, review_reason = review_to_event(data, allowed_review_severities)
-                        if not event:
-                            log.debug("Suppressed review: %s", review_reason)
-                            continue
-                        review_id = event.get("review_id")
-                        severity = event.get("review_severity", "")
-                        if not review_id or not review_tracker.claim(str(review_id), str(severity)):
-                            log.debug("Duplicate review transition %s/%s", review_id, severity)
-                            continue
-                    else:
-                        if data.get("type") != "new":
-                            continue
-                        event = data.get("after") or data.get("before")
-                        if not event:
-                            continue
-
-                    camera = event.get("camera", "?")
-                    label = event.get("label", "?")
-                    score = event.get("top_score")
-
-                    reason = should_notify(event, config)
-                    if reason:
-                        log.debug("Suppressed %s on %s: %s", label, camera, reason)
-                        continue
-
-                    # should_notify selects the first globally/per-camera allowed
-                    # object when a Review contains multiple object labels.
-                    label = event.get("label", label)
-
-                    if not cooldown.check_and_claim(camera, label):
-                        log.debug("Cooldown active for %s/%s", camera, label)
-                        continue
-
-                    # Inject custom zone message if configured
-                    zone_msg = get_zone_message(event, config)
-                    if zone_msg:
-                        event = {**event, **zone_msg}
-                        log.info(
-                            "→ %s on %s (%.0f%%, zones=%s) [%s]",
-                            label, camera, (score or 0) * 100, event.get("zones", []),
-                            zone_msg.get("custom_title", ""),
-                        )
-                    else:
-                        log.info(
-                            "→ %s on %s (%.0f%%, zones=%s)",
-                            label, camera, (score or 0) * 100, event.get("zones", []),
-                        )
-
-                    send_start = time.time()
-                    ok = await sender.send(event)
-                    send_ms = int((time.time() - send_start) * 1000)
-                    event_age_s = (send_start - float(event["start_time"])) if event.get("start_time") else None
-                    age_str = f"event_age={event_age_s:.1f}s " if event_age_s is not None else ""
-                    if ok:
-                        log.info("  ✓ Delivered %ssend=%dms", age_str, send_ms)
-                    else:
-                        log.warning("  ✗ Failed %ssend=%dms", age_str, send_ms)
+                    await pipeline.handle(str(message.topic), data)
 
         except aiomqtt.MqttError as e:
             log.warning("MQTT disconnected: %s — reconnecting in %ds", e, retry_delay)
