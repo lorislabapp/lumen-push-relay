@@ -73,13 +73,13 @@ class ReviewRelayTests(unittest.TestCase):
         self.assertIsNone(event)
         self.assertIn("no linked detection", reason)
 
-    def test_review_without_score_uses_matching_object_label(self):
+    def test_review_without_score_waits_for_detection_confidence(self):
         event, _ = review_to_event(review_message(), {"alert"})
         reason = should_notify(
             event,
             {"filters": {"labels": ["person"], "min_score": 0.9, "max_event_age_seconds": 0}},
         )
-        self.assertIsNone(reason)
+        self.assertIsNotNone(reason)
         self.assertEqual(event["label"], "person")
 
     def test_direct_payload_carries_review_contract(self):

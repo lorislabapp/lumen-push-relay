@@ -197,3 +197,13 @@ MIT — see [LICENSE](LICENSE).
 - [lumen-push](https://github.com/lorislabapp/lumen-push) — the Cloudflare Worker that receives events and signs APNs JWTs
 - [Frigate NVR](https://github.com/blakeblackshear/frigate) — open-source AI-powered NVR
 - [LorisLabs](https://lorislab.fr) — developer website
+
+## Review correlation update
+
+Notifications now require a genuine Frigate Review item correlated with its camera-consistent object detection. Object events alone never authorize a notification. Confidence is Frigate top_score; missing or invalid scores cannot pass a configured threshold. Default Review severity remains alert. Existing object/camera/zone/schedule filters apply before delivery.
+
+The MQTT identity must allow read access to the configured prefix's events, reviews and tracked_object_update topics (normally frigate/events, frigate/reviews and frigate/tracked_object_update). Custom prefixes are preserved; LUMEN_EVENT_TOPIC, LUMEN_REVIEW_TOPIC and LUMEN_IDENTITY_TOPIC can override the individual topics. ALLOW_RAW_EVENTS no longer bypasses correlation in the delivery loop.
+
+Mount persistent storage at /config to preserve Review delivery state across restarts; LUMEN_REVIEW_STATE_PATH can select another writable path. Failed delivery does not consume successful-delivery deduplication or local cooldown. Concurrent or cross-region exactly-once delivery is not guaranteed.
+
+For Lumen's Review-alert-only setting, use this updated relay and confirm that the app's supported delivery filters are synchronized with the push service. An old raw-object relay cannot supply Review evidence and will be suppressed by that option. Example local policy: FILTER_LABELS=person,car,cat, FILTER_MIN_SCORE=0.8, FILTER_REVIEW_SEVERITIES=alert and COOLDOWN_SECONDS=120. Adjust to your installation. GenAI descriptions are not interpreted as motion state.

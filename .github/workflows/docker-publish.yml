@@ -17,6 +17,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Set up Python for delivery regression tests
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+
+      - name: Verify Review correlation before publishing
+        run: |
+          python -m pip install -r requirements.txt pytest==9.1.1 pytest-asyncio==1.4.1
+          python -m pytest -q -p no:cacheprovider
+
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
