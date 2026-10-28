@@ -62,8 +62,10 @@ def test_invalid_confidence_is_never_eligible(correlator,value):
     assert relay.should_notify(event(score=value)['after'],CONFIG) is not None
 
 def test_pending_review_expires_before_new_event_can_resolve_it(correlator):
+    # 1.2.2: an open Review stays eligible up to the 15-minute hard cap
+    # (was 120 s); past the cap a new event can no longer resolve it.
     assert correlator.ingest_review_message(review(),now=NOW)==[]
-    assert correlator.ingest_event_message(event(start_time=NOW+121),now=NOW+121)==[]
+    assert correlator.ingest_event_message(event(start_time=NOW+901),now=NOW+901)==[]
 
 def test_current_zones_are_preserved(correlator):
     correlator.ingest_event_message(event(current_zones=['car_presence']),now=NOW)

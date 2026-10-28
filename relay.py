@@ -11,9 +11,10 @@ import json
 import logging
 import math
 import hashlib
-from src.review_contract import ReviewCorrelator
+from src.review_contract import ReviewCorrelator, last_activity
 import os
 import time
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
@@ -27,6 +28,25 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("frigate-push")
+
+RELAY_VERSION = "1.2.2"
+
+# Worker outcomes that mean "the Worker deliberately did not push" — terminal,
+# not worth retrying. rate_limited and failed are retryable.
+_WORKER_POLICY_OUTCOMES = frozenset({"duplicate", "filtered", "cooldown"})
+WORKER_RATE_LIMIT_RETRY_SECONDS = 6.0
+
+
+@dataclass
+class DeliveryResult:
+    """Outcome of one Review delivery across every configured URL.
+
+    accepted: terminal — record delivery state, do not retry.
+    notified: at least one device was actually pushed.
+    """
+    accepted: bool
+    notified: bool
+    outcomes: list = field(default_factory=list)
 
 # APNs endpoints (direct mode only)
 APNS_HOST = {
@@ -45,45 +65,107 @@ class WorkerSender:
     device regardless of how many URLs are configured.
     """
 
-    def __init__(self, push_urls: list[str]):
+    def __init__(self, push_urls: list[str], *, client: httpx.AsyncClient | None = None, sleep=None):
         if not push_urls:
             raise ValueError("WorkerSender requires at least one URL")
         self.push_urls = list(push_urls)
-        self._client = httpx.AsyncClient(timeout=10)
+        self._client = client or httpx.AsyncClient(timeout=10)
+        self._sleep = sleep or asyncio.sleep
 
-    async def _send_one(self, url: str, payload: dict) -> bool:
+    async def _post(self, url: str, payload: dict) -> tuple[str, list]:
+        """One POST. Returns (status, outcomes) with status one of
+        "sent", "suppressed", "rate_limited", "failed"."""
         try:
             resp = await self._client.post(
                 url,
                 json=payload,
                 headers={"Content-Type": "application/json"},
             )
-            if resp.status_code == 200:
-                return True
-            log.error("Worker error %d for %s: %s", resp.status_code, _mask_url(url), resp.text)
-            return False
         except Exception as e:
-            log.error("Worker request failed for %s: %s", _mask_url(url), e)
-            return False
+            log.error("Worker request failed for %s: %s", _mask_url(url), type(e).__name__)
+            return "failed", []
+        if resp.status_code != 200:
+            log.error("Worker error %d for %s: %s", resp.status_code, _mask_url(url), resp.text[:200])
+            return "failed", []
+        return classify_worker_response(resp.text, _mask_url(url))
 
-    async def send(self, event: dict) -> bool:
+    async def _send_one(self, url: str, payload: dict) -> tuple[str, list]:
+        status, outcomes = await self._post(url, payload)
+        if status == "rate_limited":
+            log.info("Worker rate-limited %s; retrying once in %.0fs", _mask_url(url), WORKER_RATE_LIMIT_RETRY_SECONDS)
+            await self._sleep(WORKER_RATE_LIMIT_RETRY_SECONDS)
+            status, outcomes = await self._post(url, payload)
+        return status, outcomes
+
+    async def send(self, event: dict) -> DeliveryResult:
         """POST one canonical Review envelope to every configured Worker URL.
 
-        Returns True if at least one URL accepted the payload — that
-        matches the prior single-URL semantics so the main loop's
-        ok/fail logging stays meaningful.
+        Terminal (accepted) only when no URL needs a retry. A URL whose Worker
+        deliberately suppressed the push (duplicate/filtered/cooldown) counts
+        as terminal but not as notified.
         """
         results = await asyncio.gather(
             *(self._send_one(url, event) for url in self.push_urls),
             return_exceptions=False,
         )
-        delivered = sum(1 for ok in results if ok)
-        if delivered < len(self.push_urls):
-            log.warning("Fan-out partial: %d/%d URLs delivered", delivered, len(self.push_urls))
-        return delivered == len(self.push_urls)
+        statuses = [status for status, _ in results]
+        retryable = sum(1 for status in statuses if status in {"failed", "rate_limited"})
+        if retryable:
+            log.warning("Fan-out partial: %d/%d URLs need a retry", retryable, len(self.push_urls))
+        return DeliveryResult(
+            accepted=retryable == 0,
+            notified=any(status == "sent" for status in statuses),
+            outcomes=[outcome for _, outs in results for outcome in outs],
+        )
 
     async def close(self):
         await self._client.aclose()
+
+
+def classify_worker_response(body: str, masked_url: str = "") -> tuple[str, list]:
+    """Interpret a 200 response from the lumen-push Worker.
+
+    Newer Workers answer JSON {"ok", "delivered", "suppressed", "outcomes"};
+    older ones answer the plain text "OK", which keeps meaning "sent".
+    """
+    text = (body or "").strip()
+    if not text.startswith("{"):
+        return "sent", []
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return "sent", []
+    if not isinstance(data, dict):
+        return "sent", []
+    raw = data.get("outcomes")
+    outcomes = []
+    for item in raw if isinstance(raw, list) else []:
+        if isinstance(item, dict) and isinstance(item.get("outcome"), str):
+            reason = item.get("reason")
+            outcomes.append({
+                "outcome": item["outcome"][:32],
+                "reason": reason[:120] if isinstance(reason, str) else "",
+            })
+    delivered = data.get("delivered")
+    suppressed = data.get("suppressed")
+    log.info(
+        "Worker %s: ok=%s delivered=%s suppressed=%s outcomes=[%s]",
+        masked_url, data.get("ok"), delivered, suppressed,
+        ", ".join(o["outcome"] + (f"({o['reason']})" if o["reason"] else "") for o in outcomes[:16]),
+    )
+    if data.get("ok") is False:
+        return "failed", outcomes
+    if type(delivered) is not int:
+        # JSON without a delivered count: trust ok, as with plain "OK".
+        return "sent", outcomes
+    if delivered > 0:
+        return "sent", outcomes
+    kinds = {o["outcome"] for o in outcomes}
+    if "rate_limited" in kinds:
+        return "rate_limited", outcomes
+    if kinds and kinds <= _WORKER_POLICY_OUTCOMES:
+        return "suppressed", outcomes
+    return "failed", outcomes
 
 
 def _mask_url(url: str) -> str:
@@ -273,7 +355,7 @@ def build_apns_payload(event: dict) -> dict:
     zones = event.get("zones", [])
     sub_label = event.get("sub_label")
 
-    camera_display = camera.replace("_", " ").title()
+    camera_display = event.get("camera_display_name") or camera.replace("_", " ").title()
 
     body_parts = []
     if zones:
@@ -341,10 +423,12 @@ def should_notify(event: dict, config: dict) -> str | None:
     # these produces "fake-fresh" pushes on the device — user sees a banner now
     # for something that happened hours ago. Default 120s, configurable via
     # FILTER_MAX_EVENT_AGE / filters.max_event_age_seconds (0 disables).
+    # Age is measured from the object's latest Frigate activity (frame_time /
+    # end_time), so the "end" message carrying the final score is not stale.
     max_age = filters.get("max_event_age_seconds", 120)
     start_time = event.get("start_time")
     if max_age and start_time:
-        age = time.time() - float(start_time)
+        age = time.time() - (last_activity(event) or float(start_time))
         if age > max_age:
             return f"stale event (age={age:.0f}s > {max_age}s)"
 
@@ -399,6 +483,29 @@ def should_notify(event: dict, config: dict) -> str | None:
     return None
 
 
+def suppression_code(reason: str | None) -> str | None:
+    """Map a should_notify() reason to a stable log code."""
+    if reason is None:
+        return None
+    if reason.startswith("stale event"):
+        return "expired"
+    if reason.startswith("score "):
+        return "below_min_score"
+    if reason.startswith("labels "):
+        return "label_filtered"
+    if reason == "stationary":
+        return "stationary"
+    if reason.startswith("camera ") and "schedule" in reason:
+        return "schedule"
+    if reason.startswith("camera "):
+        return "camera_filtered"
+    if reason.startswith("not in required zones"):
+        return "zone_filtered"
+    if "confidence" in reason:
+        return "invalid_score"
+    return "filtered"
+
+
 def get_zone_message(event: dict, config: dict) -> dict | None:
     """Return custom title/body if event matches a zone_messages rule, or None."""
     camera = event.get("camera", "")
@@ -439,6 +546,99 @@ def _collect_push_urls_from_env() -> list[str]:
     return ordered
 
 
+def _review_severities_from_env() -> str:
+    """REVIEW_SEVERITIES, with FILTER_REVIEW_SEVERITIES as deprecated alias."""
+    current = os.environ.get("REVIEW_SEVERITIES", "").strip()
+    legacy = os.environ.get("FILTER_REVIEW_SEVERITIES", "").strip()
+    if legacy and current:
+        log.warning("FILTER_REVIEW_SEVERITIES is deprecated and ignored because REVIEW_SEVERITIES is set")
+    elif legacy:
+        log.warning("FILTER_REVIEW_SEVERITIES is deprecated; rename it to REVIEW_SEVERITIES")
+        return legacy
+    return current or "alert"
+
+
+class CameraNameResolver:
+    """Opt-in camera id → Frigate friendly_name map, read from /api/config.
+
+    Refreshed at start and every refresh_seconds. Any failure keeps the last
+    good map (or none); it never blocks or fails a delivery.
+    """
+
+    MAX_LEN = 64
+
+    def __init__(self, base_url: str, *, user: str | None = None, password: str | None = None,
+                 token: str | None = None, tls_verify: bool = True, refresh_seconds: float = 600,
+                 client: httpx.AsyncClient | None = None):
+        self.base_url = base_url.rstrip("/")
+        self.user, self.password, self.token = user, password, token
+        self.refresh_seconds = refresh_seconds
+        self._client = client or httpx.AsyncClient(timeout=10, verify=tls_verify)
+        self.names: dict[str, str] = {}
+
+    @staticmethod
+    def _clean(value) -> str | None:
+        if not isinstance(value, str):
+            return None
+        text = "".join(ch for ch in value if ch.isprintable()).strip()
+        return text[: CameraNameResolver.MAX_LEN] or None
+
+    async def refresh(self) -> bool:
+        try:
+            headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
+            if self.user and self.password and not self.token:
+                login = await self._client.post(f"{self.base_url}/api/login",
+                                                json={"user": self.user, "password": self.password})
+                if login.status_code not in (200, 204):
+                    log.warning("Frigate login for camera names failed (HTTP %d)", login.status_code)
+                    return False
+            resp = await self._client.get(f"{self.base_url}/api/config", headers=headers)
+            if resp.status_code != 200:
+                log.warning("Frigate /api/config for camera names failed (HTTP %d)", resp.status_code)
+                return False
+            cameras = resp.json().get("cameras")
+            if not isinstance(cameras, dict):
+                return False
+            names = {}
+            for camera_id, camera_cfg in cameras.items():
+                name = self._clean(camera_cfg.get("friendly_name")) if isinstance(camera_cfg, dict) else None
+                if isinstance(camera_id, str) and name:
+                    names[camera_id] = name
+            self.names = names
+            log.info("Camera display names loaded for %d camera(s)", len(names))
+            return True
+        except Exception as e:
+            log.warning("Frigate camera names unavailable: %s", type(e).__name__)
+            return False
+
+    def display_name(self, camera: str) -> str | None:
+        return self.names.get(camera)
+
+    async def run_forever(self) -> None:
+        while True:
+            await self.refresh()
+            await asyncio.sleep(self.refresh_seconds)
+
+    async def close(self) -> None:
+        await self._client.aclose()
+
+
+def camera_resolver_from_config(frigate_cfg: dict) -> "CameraNameResolver | None":
+    url = frigate_cfg.get("url")
+    if not isinstance(url, str) or not url.strip():
+        return None
+    if not url.startswith(("http://", "https://")):
+        log.warning("FRIGATE_URL must start with http:// or https://; camera names disabled")
+        return None
+    return CameraNameResolver(
+        url.strip(),
+        user=frigate_cfg.get("api_user"),
+        password=frigate_cfg.get("api_password"),
+        token=frigate_cfg.get("api_token"),
+        tls_verify=frigate_cfg.get("tls_verify", True) is not False,
+    )
+
+
 def load_config() -> dict:
     """Load config from file or environment variables."""
     # Check for config file
@@ -464,11 +664,20 @@ def load_config() -> dict:
             "max_event_age_seconds": int(os.environ.get("FILTER_MAX_EVENT_AGE", "120")),
             "review_severities": [
                 value.strip()
-                for value in os.environ.get("REVIEW_SEVERITIES", "alert").split(",")
+                for value in _review_severities_from_env().split(",")
                 if value.strip()
             ],
         },
     }
+    frigate_url = os.environ.get("FRIGATE_URL", "").strip()
+    if frigate_url:
+        config["frigate"]["url"] = frigate_url
+        for env_name, key in (("FRIGATE_USER", "api_user"), ("FRIGATE_PASSWORD", "api_password"),
+                              ("FRIGATE_TOKEN", "api_token")):
+            if os.environ.get(env_name):
+                config["frigate"][key] = os.environ[env_name]
+        verify = os.environ.get("FRIGATE_TLS_VERIFY", "true").strip().lower()
+        config["frigate"]["tls_verify"] = verify not in {"0", "false", "no"}
 
     # Worker mode (recommended).
     #
@@ -499,6 +708,7 @@ def load_config() -> dict:
 async def run():
     """Main loop: subscribe to MQTT, filter events, send pushes."""
     config = load_config()
+    log.info("lumen-push-relay %s starting", RELAY_VERSION)
 
     frigate_cfg = config["frigate"]
     cooldown_sec = config.get("filters", {}).get("cooldown_seconds", 120)
@@ -546,8 +756,10 @@ async def run():
         max_age_seconds=float(config.get("filters", {}).get("max_event_age_seconds", 120)),
         allowed_severities=frozenset(str(x).strip() for x in configured),
         state_path=os.environ.get("LUMEN_REVIEW_STATE_PATH", "/config/review-delivery-state.json"),
-        event_filter=lambda event: should_notify(event, config) is None,
+        event_rejection=lambda event: suppression_code(should_notify(event, config)),
     )
+    camera_names = camera_resolver_from_config(frigate_cfg)
+    names_task = asyncio.create_task(camera_names.run_forever()) if camera_names else None
     # Preserve custom MQTT prefixes; raw objects never independently authorize a push.
     topic = str(frigate_cfg.get("topic") or "frigate/reviews").rstrip("/")
     prefix = topic.rsplit("/", 1)[0] if topic.endswith(("/events", "/reviews")) else "frigate"
@@ -563,13 +775,20 @@ async def run():
             return
         message = get_zone_message({"zones": envelope.get("zones", [])}, config)
         if message: envelope = {**envelope, **message}
+        display = camera_names.display_name(camera) if camera_names else None
+        if display: envelope = {**envelope, "camera_display_name": display[:64]}
         try:
-            accepted = await sender.send(envelope)
+            result = await sender.send(envelope)
         except Exception:
-            accepted = False
-        correlator.complete_delivery(envelope, terminal=accepted)
-        if not accepted and not enrichment: cooldown.release(camera, label)
-        log.info("Review delivery %s", "accepted" if accepted else "retryable failure")
+            result = False
+        if isinstance(result, DeliveryResult):
+            accepted, notified = result.accepted, result.notified
+        else:  # DirectAPNsSender / legacy senders return a bool
+            accepted = notified = bool(result)
+        correlator.complete_delivery(envelope, terminal=accepted, notified=notified)
+        if not notified and not enrichment: cooldown.release(camera, label)
+        state = "sent" if notified else ("suppressed by Worker" if accepted else "retryable failure")
+        log.info("Review %s delivery %s", str(envelope.get("reviewId", ""))[:64], state)
 
     retry_delay = 1
     try:
@@ -599,6 +818,10 @@ async def run():
                 await asyncio.sleep(retry_delay)
                 retry_delay = min(retry_delay * 2, 60)
     finally:
+        if names_task:
+            names_task.cancel()
+        if camera_names:
+            await camera_names.close()
         await sender.close()
 
 

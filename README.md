@@ -157,13 +157,21 @@ Set `mode: worker` (default) or `mode: direct` in `config.yaml`, or omit `PUSH_U
 | `MQTT_USER` | — | MQTT username (optional) |
 | `MQTT_PASSWORD` | — | MQTT password (optional) |
 | `MQTT_TOPIC` | `frigate/reviews` | Frigate Review topic |
-| `REVIEW_SEVERITIES` | `alert` | Review severities to notify (`alert,detection` to include both) |
+| `REVIEW_SEVERITIES` | `alert` | Review severities to notify (`alert,detection` to include both). `FILTER_REVIEW_SEVERITIES` is accepted as a deprecated alias; `REVIEW_SEVERITIES` wins when both are set |
 | `ALLOW_RAW_EVENTS` | `false` | Explicit compatibility opt-in for `*/events`; may notify objects absent from Review |
 | `PUSH_URL` | — | Your push URL from Lumen (enables worker mode) |
 | `FILTER_LABELS` | `person,car,dog,cat,package` | Comma-separated allowed labels |
 | `FILTER_MIN_SCORE` | `0.6` | Minimum detection confidence |
 | `COOLDOWN_SECONDS` | `120` | Min seconds between pushes for same camera+label |
 | `CONFIG_PATH` | `/config/config.yaml` | Path to config file (overrides env vars if present) |
+| `FRIGATE_URL` | — | Optional. Frigate API base URL (e.g. `http://192.168.1.50:5000`). Enables camera display names (`friendly_name`) in notifications |
+| `FRIGATE_TOKEN` | — | Optional. Bearer token sent to `FRIGATE_URL` (e.g. behind an authenticating proxy) |
+| `FRIGATE_USER` / `FRIGATE_PASSWORD` | — | Optional. Frigate login used when port 8971 authentication is on |
+| `FRIGATE_TLS_VERIFY` | `true` | Set `false` only for a self-signed Frigate certificate |
+
+### Camera display names (optional, 1.2.2+)
+
+When `FRIGATE_URL` is set, the relay reads `/api/config` at start and every 10 minutes and adds `camera_display_name` (Frigate `friendly_name`, max 64 characters) to each notification. If Frigate is unreachable or the camera has no `friendly_name`, the field is simply left out — delivery never waits for it. In a config file use `frigate.url`, `frigate.api_token`, `frigate.api_user`, `frigate.api_password`, `frigate.tls_verify`.
 
 ### Direct mode only
 
@@ -187,6 +195,12 @@ The relay forwards events in <100 ms on a LAN. If you see delays, check APNs lat
 **Events logged but no push**  
 The worker mode returns 200 even if APNs drops the push. Check the worker logs (`wrangler tail` if self-hosting) or send a test push from Lumen's Settings → Push Notifications → Send Test.
 
+## Late confidence and Review end (1.2.2)
+
+Frigate often publishes the final confidence of an object only on its `end` message. The relay now uses `end` messages for both events and Reviews. A Review that is still open stays eligible for up to 15 minutes, as long as the detection itself shows fresh activity (`FILTER_MAX_EVENT_AGE`, default 120 s, now measured from Frigate's latest frame/end time). A Review is sent at most once per severity. When a Review closes without being sent, the log says why: `below_min_score`, `label_filtered`, `stationary`, `severity`, `expired`, `camera_filtered`, `zone_filtered`, `schedule`.
+
+Newer lumen-push Workers answer with per-device outcomes. When nothing was delivered because of a rate limit, the relay retries once after 6 s. A push the Worker deliberately suppressed (duplicate, filtered, cooldown) is recorded as handled and is not retried. Older Workers answering `OK` work as before.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
@@ -206,4 +220,4 @@ The MQTT identity must allow read access to the configured prefix's events, revi
 
 Mount persistent storage at /config to preserve Review delivery state across restarts; LUMEN_REVIEW_STATE_PATH can select another writable path. Failed delivery does not consume successful-delivery deduplication or local cooldown. Concurrent or cross-region exactly-once delivery is not guaranteed.
 
-For Lumen's Review-alert-only setting, use this updated relay and confirm that the app's supported delivery filters are synchronized with the push service. An old raw-object relay cannot supply Review evidence and will be suppressed by that option. Example local policy: FILTER_LABELS=person,car,cat, FILTER_MIN_SCORE=0.8, FILTER_REVIEW_SEVERITIES=alert and COOLDOWN_SECONDS=120. Adjust to your installation. GenAI descriptions are not interpreted as motion state.
+For Lumen's Review-alert-only setting, use this updated relay and confirm that the app's supported delivery filters are synchronized with the push service. An old raw-object relay cannot supply Review evidence and will be suppressed by that option. Example local policy: FILTER_LABELS=person,car,cat, FILTER_MIN_SCORE=0.8, REVIEW_SEVERITIES=alert and COOLDOWN_SECONDS=120. Adjust to your installation. GenAI descriptions are not interpreted as motion state.

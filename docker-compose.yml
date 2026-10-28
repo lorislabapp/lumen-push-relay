@@ -22,6 +22,7 @@ services:
       FILTER_MIN_SCORE: "0.6"
       COOLDOWN_SECONDS: "120"
       REVIEW_SEVERITIES: "alert"
+      # FRIGATE_URL: "http://192.168.1.50:5000"  # optional: camera display names
 
     # Optional: mount a config file for advanced per-camera rules
     # volumes:

@@ -13,11 +13,25 @@ import json
 import math
 import os
 from pathlib import Path
+import logging
 import time
 from typing import Any, Callable
 
 
 VALID_SEVERITIES = frozenset({"detection", "alert"})
+# Frigate publishes "new", "update" and "end" on both frigate/events and
+# frigate/reviews. The final top_score of a tracked object frequently arrives
+# only on "end", so "end" is evidence too.
+ACCEPTED_MESSAGE_TYPES = frozenset({"new", "update", "end"})
+# A Review that is still open stays eligible this long after it started, even
+# when its confidence crosses the threshold late. Fresh activity is still
+# required from the detection itself (max_age_seconds).
+DEFAULT_MAX_OPEN_SECONDS = 900.0
+# After a Review ends, wait this long for a straggling event "end" message
+# before finalizing it as not sent.
+DEFAULT_END_GRACE_SECONDS = 30.0
+
+log = logging.getLogger("frigate-push")
 
 
 @dataclass(frozen=True)
@@ -36,11 +50,20 @@ class ReviewCorrelator:
         max_pending_reviews: int = 256,
         state_path: str | Path | None = None,
         event_filter: Callable[[dict[str, Any]], bool] | None = None,
+        event_rejection: Callable[[dict[str, Any]], str | None] | None = None,
         allowed_severities: frozenset[str] = VALID_SEVERITIES,
+        max_open_seconds: float = DEFAULT_MAX_OPEN_SECONDS,
+        end_grace_seconds: float = DEFAULT_END_GRACE_SECONDS,
     ) -> None:
         if not allowed_severities or not allowed_severities <= VALID_SEVERITIES:
             raise ValueError("review_severities must contain alert and/or detection")
         self.event_filter = event_filter
+        # Optional: returns None when the event may notify, otherwise a stable
+        # reason code. Takes precedence over event_filter and feeds the
+        # "why was this Review not sent" log.
+        self.event_rejection = event_rejection
+        self.max_open_seconds = max(float(max_open_seconds), float(max_age_seconds))
+        self.end_grace_seconds = float(end_grace_seconds)
         self.allowed_severities = allowed_severities
         self._notified: OrderedDict[str, float] = OrderedDict()
         self.source = source
@@ -63,14 +86,17 @@ class ReviewCorrelator:
 
     def ingest_event_message(self, message: Any, *, now: float | None = None) -> list[dict[str, Any]]:
         now = time.time() if now is None else now
-        if not isinstance(message, dict) or message.get("type") not in {"new", "update"}:
+        if not isinstance(message, dict) or message.get("type") not in ACCEPTED_MESSAGE_TYPES:
             return []
         event = message.get("after")
         if not isinstance(event, dict) or not self._valid_event(event, now):
+            self._expire(now)
             return []
         event_id = event["id"]
         previous = self._events.get(event_id, {})
         self._events[event_id] = dict(event)
+        if message.get("type") == "end":
+            self._events[event_id]["_ended"] = True
         for key in ("_review_id", "_review_severity"):
             if key in previous:
                 self._events[event_id][key] = previous[key]
@@ -80,24 +106,45 @@ class ReviewCorrelator:
         ready: list[dict[str, Any]] = []
         for review_id, review in list(self._pending.items()):
             if event_id in self._detection_ids(review):
-                ready.extend(self._resolve(review, now))
+                resolved = self._resolve(review, now)
+                ready.extend(resolved)
+                if (not resolved and review.get("_ended_at") is not None
+                        and self._all_detections_ended(review)):
+                    self._finalize(review_id, now)
         self._expire(now)
         return ready
 
     def ingest_review_message(self, message: Any, *, now: float | None = None) -> list[dict[str, Any]]:
         now = time.time() if now is None else now
-        if not isinstance(message, dict) or message.get("type") not in {"new", "update"}:
+        if not isinstance(message, dict) or message.get("type") not in ACCEPTED_MESSAGE_TYPES:
             return []
         review = message.get("after")
         if not isinstance(review, dict) or not self._valid_review(review, now):
+            self._expire(now)
+            return []
+        review_id = review["id"]
+        delivery_key = f"{review_id}/{review['severity']}"
+        if delivery_key in self._delivered or delivery_key in self._inflight:
+            # Already sent (or being sent) at this severity: never resend and
+            # never re-queue it as pending.
+            self._expire(now)
             return []
         resolved = self._resolve(review, now)
         if resolved:
             return resolved
-        review_id = review["id"]
-        self._pending[review_id] = dict(review)
+        pending = dict(review)
+        previous = self._pending.get(review_id)
+        if message.get("type") == "end" or (previous or {}).get("_ended_at") is not None:
+            pending["_ended_at"] = (previous or {}).get("_ended_at", now)
+        self._pending[review_id] = pending
         self._pending.move_to_end(review_id)
-        self._trim(self._pending, self.max_pending_reviews)
+        while len(self._pending) > self.max_pending_reviews:
+            evicted_id, evicted = self._pending.popitem(last=False)
+            self._log_not_sent(evicted_id, evicted, "capacity", now)
+        if pending.get("_ended_at") is not None and self._all_detections_ended(pending):
+            # Review closed and every referenced detection has reported its
+            # final score: nothing can still make it eligible.
+            self._finalize(review_id, now)
         self._expire(now)
         return []
 
@@ -148,7 +195,7 @@ class ReviewCorrelator:
 
         if not self._valid_event(event, now):
             return []
-        if self.event_filter is not None and not self.event_filter(event):
+        if self._rejection(event) is not None:
             return []
 
         # One correction per event: a face and a description arriving moments
@@ -188,7 +235,7 @@ class ReviewCorrelator:
         candidates = [event for event in candidates if self._valid_event(event, now)
                       and event["camera"] == review["camera"]
                       and event["start_time"] + self.future_skew_seconds >= review["start_time"]
-                      and (self.event_filter is None or self.event_filter(event))]
+                      and self._rejection(event) is None]
         if not candidates:
             return []
         event = max(candidates, key=lambda item: (float(item.get("top_score", 0)), str(item.get("id", ""))))
@@ -257,6 +304,53 @@ class ReviewCorrelator:
         self._inflight.add(delivery_key)
         return [envelope]
 
+    def _rejection(self, event: dict[str, Any]) -> str | None:
+        """None when the event passes local policy, else a reason code."""
+        if self.event_rejection is not None:
+            return self.event_rejection(event)
+        if self.event_filter is not None and not self.event_filter(event):
+            return "filtered"
+        return None
+
+    def _all_detections_ended(self, review: dict[str, Any]) -> bool:
+        ids = self._detection_ids(review)
+        return bool(ids) and all(self._events.get(i, {}).get("_ended") for i in ids)
+
+    def explain_not_sent(self, review: dict[str, Any], now: float, *, cap_reached: bool = False) -> str:
+        """Best-effort reason code for a pending Review that was never sent."""
+        if review.get("severity") not in self.allowed_severities:
+            return "severity"
+        cached = [self._events[i] for i in self._detection_ids(review) if i in self._events]
+        cached = [e for e in cached if e.get("camera") == review.get("camera")]
+        if not cached:
+            return "expired" if cap_reached else "no_detection_evidence"
+        best = max(cached, key=lambda item: (float(item.get("top_score", 0) or 0), str(item.get("id", ""))))
+        if not self._valid_event(best, now):
+            return "expired"
+        reason = self._rejection(best)
+        if reason:
+            return reason
+        return "expired" if cap_reached else "unresolved"
+
+    def _finalize(self, review_id: str, now: float, *, cap_reached: bool = False) -> None:
+        review = self._pending.pop(review_id, None)
+        if review is None:
+            return
+        reason = self.explain_not_sent(review, now, cap_reached=cap_reached)
+        self._log_not_sent(review_id, review, reason, now)
+
+    def _log_not_sent(self, review_id: str, review: dict[str, Any], reason: str, now: float) -> None:
+        delivery_key = f"{review_id}/{review.get('severity')}"
+        if delivery_key in self._delivered or delivery_key in self._inflight:
+            return
+        scores = [self._events[i].get("top_score") for i in self._detection_ids(review) if i in self._events]
+        scores = [float(s) for s in scores if type(s) in (int, float) and math.isfinite(s)]
+        log.info(
+            "Review %s not sent: %s (camera=%s severity=%s best_score=%s)",
+            str(review_id)[:64], reason, str(review.get("camera", ""))[:64],
+            review.get("severity"), f"{max(scores):.3f}" if scores else "n/a",
+        )
+
     def complete_delivery(self, envelope: dict[str, Any], *, terminal: bool, notified: bool = True, now: float | None = None) -> None:
         """Release an in-flight Review and persist only terminal outcomes.
 
@@ -301,7 +395,12 @@ class ReviewCorrelator:
         if "stationary" in event and not isinstance(event["stationary"], bool):
             return False
         age = now - float(detected_at)
-        return -self.future_skew_seconds <= age <= self.max_age_seconds
+        if not -self.future_skew_seconds <= age <= self.max_open_seconds:
+            return False
+        # Freshness follows the object's latest Frigate-reported activity
+        # (frame_time / end_time), so a late "end" carrying the final score is
+        # still evidence while an idle replayed object is not.
+        return now - last_activity(event) <= self.max_age_seconds
 
     def _valid_review(self, review: dict[str, Any], now: float) -> bool:
         if not isinstance(review.get("id"), str) or not review["id"]:
@@ -316,8 +415,13 @@ class ReviewCorrelator:
         if type(start) not in (int, float) or not math.isfinite(start) or start <= 0:
             return False
         age = now - float(start)
-        if age < -self.future_skew_seconds or age > self.max_age_seconds:
+        if age < -self.future_skew_seconds or age > self.max_open_seconds:
             return False
+        end = review.get("end_time")
+        if type(end) in (int, float) and math.isfinite(end) and end > 0:
+            # A closed Review only stays actionable briefly after it ended.
+            if now - float(end) > self.max_age_seconds:
+                return False
         return True
 
     @staticmethod
@@ -329,14 +433,22 @@ class ReviewCorrelator:
         return [item for item in detections if isinstance(item, str) and item][:256]
 
     def _expire(self, now: float) -> None:
-        for key, event in list(self._events.items()):
-            detected_at = event.get("start_time")
-            if not isinstance(detected_at, (int, float)) or now - detected_at > self.max_age_seconds:
-                self._events.pop(key, None)
+        # Pending Reviews first, so their reason can still see cached events.
         for key, review in list(self._pending.items()):
             start = review.get("start_time")
-            if isinstance(start, (int, float)) and now - start > self.max_age_seconds:
-                self._pending.pop(key, None)
+            ended_at = review.get("_ended_at")
+            if isinstance(start, (int, float)) and now - start > self.max_open_seconds:
+                self._finalize(key, now, cap_reached=True)
+            elif not self._valid_review(review, now):
+                self._finalize(key, now, cap_reached=True)
+            elif isinstance(ended_at, (int, float)) and now - ended_at > self.end_grace_seconds:
+                self._finalize(key, now)
+        for key, event in list(self._events.items()):
+            detected_at = event.get("start_time")
+            if not isinstance(detected_at, (int, float)) or now - detected_at > self.max_open_seconds:
+                self._events.pop(key, None)
+            elif event.get("_ended") and now - last_activity(event) > self.max_age_seconds:
+                self._events.pop(key, None)
         for key, claimed_at in list(self._delivered.items()):
             if now - claimed_at > 86_400:
                 self._delivered.pop(key, None)
@@ -369,3 +481,10 @@ class ReviewCorrelator:
         payload = json.dumps({"delivered": self._delivered}, separators=(",", ":"))
         temporary.write_text(payload, encoding="utf-8")
         os.replace(temporary, self.state_path)
+
+
+def last_activity(item: dict[str, Any]) -> float:
+    """Latest Frigate-reported timestamp of an event or Review (start/frame/end)."""
+    values = [item.get(key) for key in ("start_time", "frame_time", "end_time")]
+    finite = [float(v) for v in values if type(v) in (int, float) and math.isfinite(v) and v > 0]
+    return max(finite) if finite else 0.0

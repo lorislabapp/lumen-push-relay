@@ -10,6 +10,10 @@ frigate:
   # mqtt_user: your_user       # optional
   # mqtt_password: your_pass   # optional
   topic: frigate/reviews       # Frigate's user-visible Review change feed
+  # Optional (1.2.2+): camera display names from Frigate's friendly_name.
+  # url: http://192.168.1.50:5000
+  # api_token: ...             # or api_user / api_password when Frigate auth is on
+  # tls_verify: true
 
 mode: worker                   # "worker" (recommended) or "direct"
 
